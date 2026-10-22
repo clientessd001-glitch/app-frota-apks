@@ -19,18 +19,23 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Configurar Android SDK e Licenças
+      - name: 3. Baixar e Configurar Android Command Line Tools
         run: |
-          # Define o caminho do Android SDK no ambiente do GitHub
-          export ANDROID_SDK_ROOT=$HOME/android-sdk
-          mkdir -p $ANDROID_SDK_ROOT/licenses
-          
-          # Aceita automaticamente as licenças do SDK do Android para evitar falhas
-          echo -e "\n24333f8a43b6806230f50647c1f6f107dc6531d3" > $ANDROID_SDK_ROOT/licenses/android-sdk-license
-          echo -e "\n84831b9409646a914e3037042ce9c2e5ad6b853f" >> $ANDROID_SDK_ROOT/licenses/android-sdk-license
-          echo -e "\nd975f751698777b6ceb61250263cfa8d0f2774nombre" >> $ANDROID_SDK_ROOT/licenses/android-sdk-license || true
-          
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk/cmdline-tools
+          curl -s https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o commandlinetools.zip
+          unzip -q commandlinetools.zip
+          mkdir -p latest
+          mv cmdline-tools/* latest/ 2>/dev/null || true
+          rm -rf commandlinetools.zip
+
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-33" "build-tools;33.0.2" > /dev/null 2>&1
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
       - name: 4. Preparar estrutura base do projeto Android
         run: |
@@ -96,7 +101,8 @@ jobs:
 
       - name: 5. Compilar APK 1 - Monitor de Dados
         run: |
-          gradle assembleDebug --no-daemon
+          export ANDROID_HOME=$HOME/android-sdk
+          ./gradlew assembleDebug --no-daemon || gradle assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk APKs-Prontos/Monitor-Dados.apk
 
       - name: 6. Compilar APK 2 - Painel Central
@@ -108,7 +114,8 @@ jobs:
           sed -i 's/applicationId "com.example.monitordados"/applicationId "com.example.painelcentral"/g' app/build.gradle
           sed -i 's/android:label="Monitor de Dados"/android:label="Painel Central"/g' app/src/main/AndroidManifest.xml
 
-          gradle assembleDebug --no-daemon
+          export ANDROID_HOME=$HOME/android-sdk
+          ./gradlew assembleDebug --no-daemon || gradle assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk APKs-Prontos/Painel-Central.apk
 
       - name: 7. Publicar os 2 APKs para Download
