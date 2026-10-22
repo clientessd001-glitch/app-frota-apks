@@ -19,7 +19,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Baixar e Configurar Android Command Line Tools
+      - name: 3. Baixar e Configurar Android SDK e Gradle
         run: |
           mkdir -p $HOME/android-sdk/cmdline-tools
           cd $HOME/android-sdk/cmdline-tools
@@ -37,7 +37,7 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-      - name: 4. Preparar estrutura base do projeto Android
+      - name: 4. Preparar estrutura base do projeto e Gradle Wrapper
         run: |
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/example/monitordados
@@ -99,10 +99,14 @@ jobs:
           }
           EOF
 
+          # Gera o gradle wrapper para permitir a compilação limpa
+          gradle wrapper --gradle-version 7.6.4
+
       - name: 5. Compilar APK 1 - Monitor de Dados
         run: |
           export ANDROID_HOME=$HOME/android-sdk
-          ./gradlew assembleDebug --no-daemon || gradle assembleDebug --no-daemon
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk APKs-Prontos/Monitor-Dados.apk
 
       - name: 6. Compilar APK 2 - Painel Central
@@ -115,7 +119,7 @@ jobs:
           sed -i 's/android:label="Monitor de Dados"/android:label="Painel Central"/g' app/src/main/AndroidManifest.xml
 
           export ANDROID_HOME=$HOME/android-sdk
-          ./gradlew assembleDebug --no-daemon || gradle assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk APKs-Prontos/Painel-Central.apk
 
       - name: 7. Publicar os 2 APKs para Download
