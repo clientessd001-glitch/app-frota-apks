@@ -21,11 +21,9 @@ jobs:
 
       - name: 3. Instalar Gradle 7.6.4 e Configurar Android SDK
         run: |
-          # Transfere e extrai o Gradle 7.6.4 isolado para não usar o Gradle 9 do sistema
           curl -sL https://services.gradle.org/distributions/gradle-7.6.4-bin.zip -o /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /tmp
 
-          # Configura o Android SDK
           mkdir -p $HOME/android-sdk/cmdline-tools
           cd $HOME/android-sdk/cmdline-tools
           curl -sL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o commandlinetools.zip
@@ -42,15 +40,90 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-      - name: 4. Preparar estrutura base do projeto
+      - name: 4. Organizar ficheiros e preparar estrutura do projeto
         run: |
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/example/monitordados
           mkdir -p APKs-Prontos
 
-          if [ -f "central.html" ] && [ ! -f "app/src/main/assets/central.html" ]; then
-            cp central.html app/src/main/assets/central.html
+          # Procura index.html, central.html e MainActivity.java em qualquer pasta (ignorando maiúsculas/minúsculas)
+          FOUND_INDEX=$(find . -maxdepth 4 -iname "index.html" | head -n 1)
+          if [ -n "$FOUND_INDEX" ] && [ "$FOUND_INDEX" != "./app/src/main/assets/index.html" ]; then
+            cp "$FOUND_INDEX" app/src/main/assets/index.html
           fi
+
+          FOUND_CENTRAL=$(find . -maxdepth 4 -iname "central.html" | head -n 1)
+          if [ -n "$FOUND_CENTRAL" ] && [ "$FOUND_CENTRAL" != "./app/src/main/assets/central.html" ]; then
+            cp "$FOUND_CENTRAL" app/src/main/assets/central.html
+          fi
+
+          FOUND_JAVA=$(find . -maxdepth 6 -iname "*MainActivity*.java" | head -n 1)
+          if [ -n "$FOUND_JAVA" ] && [ "$FOUND_JAVA" != "./app/src/main/java/com/example/monitordados/MainActivity.java" ]; then
+            cp "$FOUND_JAVA" app/src/main/java/com/example/monitordados/MainActivity.java
+          fi
+
+          # Garante que o AndroidManifest.xml existe sempre no caminho exato
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools"
+              package="com.example.monitordados">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Monitor de Dados"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".MainActivity$MonitorSempreAtivoService" android:enabled="true" android:exported="false" />
+
+                  <service
+                      android:name=".MainActivity$FirewallVpnService"
+                      android:permission="android.permission.BIND_VPN_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+                  <receiver android:name=".MainActivity$BootReceiver" android:enabled="true" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      </intent-filter>
+                  </receiver>
+
+              </application>
+          </manifest>
+          EOF
 
           echo "sdk.dir=$HOME/android-sdk" > local.properties
 
