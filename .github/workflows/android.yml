@@ -40,29 +40,24 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-      - name: 4. Organizar ficheiros e preparar estrutura do projeto
+      - name: 4. Criar estrutura completa do projeto (Manifest + Java + HTML)
         run: |
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/example/monitordados
           mkdir -p APKs-Prontos
 
-          # Procura index.html, central.html e MainActivity.java em qualquer pasta (ignorando maiúsculas/minúsculas)
-          FOUND_INDEX=$(find . -maxdepth 4 -iname "index.html" | head -n 1)
+          # Localiza index.html e central.html em qualquer pasta do repositório
+          FOUND_INDEX=$(find . -maxdepth 5 -iname "*index*.html" | head -n 1)
           if [ -n "$FOUND_INDEX" ] && [ "$FOUND_INDEX" != "./app/src/main/assets/index.html" ]; then
             cp "$FOUND_INDEX" app/src/main/assets/index.html
           fi
 
-          FOUND_CENTRAL=$(find . -maxdepth 4 -iname "central.html" | head -n 1)
+          FOUND_CENTRAL=$(find . -maxdepth 5 -iname "*central*.html" | head -n 1)
           if [ -n "$FOUND_CENTRAL" ] && [ "$FOUND_CENTRAL" != "./app/src/main/assets/central.html" ]; then
             cp "$FOUND_CENTRAL" app/src/main/assets/central.html
           fi
 
-          FOUND_JAVA=$(find . -maxdepth 6 -iname "*MainActivity*.java" | head -n 1)
-          if [ -n "$FOUND_JAVA" ] && [ "$FOUND_JAVA" != "./app/src/main/java/com/example/monitordados/MainActivity.java" ]; then
-            cp "$FOUND_JAVA" app/src/main/java/com/example/monitordados/MainActivity.java
-          fi
-
-          # Garante que o AndroidManifest.xml existe sempre no caminho exato
+          # 1. Cria o AndroidManifest.xml no caminho exato
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -75,7 +70,6 @@ jobs:
               <uses-permission android:name="android.permission.READ_PHONE_STATE" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-              <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -87,6 +81,7 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:label="Monitor de Dados"
+                  android:icon="@android:drawable/ic_dialog_info"
                   android:supportsRtl="true"
                   android:usesCleartextTraffic="true"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
@@ -102,7 +97,10 @@ jobs:
                       </intent-filter>
                   </activity>
 
-                  <service android:name=".MainActivity$MonitorSempreAtivoService" android:enabled="true" android:exported="false" />
+                  <service
+                      android:name=".MainActivity$MonitorSempreAtivoService"
+                      android:enabled="true"
+                      android:exported="false" />
 
                   <service
                       android:name=".MainActivity$FirewallVpnService"
@@ -113,7 +111,10 @@ jobs:
                       </intent-filter>
                   </service>
 
-                  <receiver android:name=".MainActivity$BootReceiver" android:enabled="true" android:exported="true">
+                  <receiver
+                      android:name=".MainActivity$BootReceiver"
+                      android:enabled="true"
+                      android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.BOOT_COMPLETED" />
                           <action android:name="android.intent.action.QUICKBOOT_POWERON" />
@@ -123,6 +124,595 @@ jobs:
 
               </application>
           </manifest>
+          EOF
+
+          # 2. Cria o MainActivity.java garantido e compatível com Android 8 a 15
+          cat << 'EOF' > app/src/main/java/com/example/monitordados/MainActivity.java
+          package com.example.monitordados;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AppOpsManager;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.app.usage.NetworkStats;
+          import android.app.usage.NetworkStatsManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.location.Location;
+          import android.location.LocationManager;
+          import android.net.ConnectivityManager;
+          import android.net.Network;
+          import android.net.NetworkCapabilities;
+          import android.net.TrafficStats;
+          import android.net.Uri;
+          import android.net.VpnService;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.IBinder;
+          import android.os.ParcelFileDescriptor;
+          import android.os.PowerManager;
+          import android.os.Process;
+          import android.provider.Settings;
+          import android.telephony.TelephonyManager;
+          import android.view.View;
+          import android.webkit.GeolocationPermissions;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.IOException;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.Calendar;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+
+              private static final int REQ_PERMISSOES = 101;
+              private static final int REQ_VPN = 102;
+
+              public static MainActivity instanciaAtiva = null;
+              private WebViewSempreAtivo webView;
+
+              private static volatile double ultimaVelocidadeMbps = 0.0;
+              private static volatile int ultimaLatenciaMs = 0;
+              private static long ultimoRxBytesTotal = 0;
+              private static long ultimoTxBytesTotal = 0;
+              private static long ultimoTempoLeitura = 0;
+
+              public static class WebViewSempreAtivo extends WebView {
+                  public WebViewSempreAtivo(Context context) {
+                      super(context);
+                  }
+                  @Override
+                  protected void onWindowVisibilityChanged(int visibility) {
+                      super.onWindowVisibilityChanged(View.VISIBLE);
+                  }
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  instanciaAtiva = this;
+
+                  webView = new WebViewSempreAtivo(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setGeolocationEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+                      settings.setMediaPlaybackRequiresUserGesture(false);
+                  }
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
+                          callback.invoke(origin, true, false);
+                      }
+                  });
+
+                  webView.addJavascriptInterface(new PonteMonitorDados(this), "AndroidMonitor");
+                  webView.loadUrl("file:///android_asset/index.html");
+
+                  iniciarServico24h(this);
+                  solicitarPermissoesIniciais();
+              }
+
+              public static void iniciarServico24h(Context context) {
+                  try {
+                      Intent srv = new Intent(context, MonitorSempreAtivoService.class);
+                      context.startService(srv);
+                  } catch (Throwable ignored) {}
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  instanciaAtiva = this;
+                  if (webView != null) {
+                      webView.onResume();
+                      webView.resumeTimers();
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  if (webView != null) {
+                      webView.onResume();
+                      webView.resumeTimers();
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  moveTaskToBack(true);
+              }
+
+              private void solicitarPermissoesIniciais() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                          List<String> permissoes = new ArrayList<>();
+                          if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                              permissoes.add(Manifest.permission.ACCESS_FINE_LOCATION);
+                          }
+                          if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+                              permissoes.add(Manifest.permission.READ_PHONE_STATE);
+                          }
+                          if (Build.VERSION.SDK_INT >= 33) {
+                              if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                                  permissoes.add("android.permission.POST_NOTIFICATIONS");
+                              }
+                          }
+                          if (!permissoes.isEmpty()) {
+                              requestPermissions(permissoes.toArray(new String[0]), REQ_PERMISSOES);
+                          }
+
+                          PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                          if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                              Intent intentBat = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                              intentBat.setData(Uri.parse("package:" + getPackageName()));
+                              startActivity(intentBat);
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == REQ_VPN && resultCode == RESULT_OK) {
+                      if (FirewallVpnService.bloqueioGeralAtivo || !FirewallVpnService.listaAppsBloqueados.isEmpty()) {
+                          try {
+                              Intent serviceIntent = new Intent(this, FirewallVpnService.class);
+                              serviceIntent.setAction("ATUALIZAR");
+                              startService(serviceIntent);
+                          } catch (Throwable ignored) {}
+                      }
+                  }
+              }
+
+              private static long calcularInicioCiclo(int diaRenovacao) {
+                  Calendar cal = Calendar.getInstance();
+                  int diaAtual = cal.get(Calendar.DAY_OF_MONTH);
+                  int diaAjustado = Math.max(1, Math.min(28, diaRenovacao));
+                  if (diaAtual < diaAjustado) { cal.add(Calendar.MONTH, -1); }
+                  cal.set(Calendar.DAY_OF_MONTH, diaAjustado);
+                  cal.set(Calendar.HOUR_OF_DAY, 0);
+                  cal.set(Calendar.MINUTE, 0);
+                  cal.set(Calendar.SECOND, 0);
+                  cal.set(Calendar.MILLISECOND, 0);
+                  return cal.getTimeInMillis();
+              }
+
+              public static class BootReceiver extends BroadcastReceiver {
+                  @Override
+                  public void onReceive(Context context, Intent intent) {
+                      try {
+                          Intent i = new Intent(context, MainActivity.class);
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          context.startActivity(i);
+                      } catch (Throwable ignored) {}
+                      iniciarServico24h(context);
+                  }
+              }
+
+              public static class MonitorSempreAtivoService extends Service {
+                  private static final String CANAL_ID = "monitor_dados_24h";
+                  private PowerManager.WakeLock wakeLock;
+
+                  @Override
+                  public void onCreate() {
+                      super.onCreate();
+                      iniciarNotificacaoDiscreta();
+                      ativarWakeLock();
+                  }
+
+                  @Override
+                  public int onStartCommand(Intent intent, int flags, int startId) {
+                      iniciarNotificacaoDiscreta();
+                      ativarWakeLock();
+                      return START_STICKY;
+                  }
+
+                  private void iniciarNotificacaoDiscreta() {
+                      try {
+                          NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm != null) {
+                              NotificationChannel channel = new NotificationChannel(CANAL_ID, "Monitoramento 24h", NotificationManager.IMPORTANCE_LOW);
+                              channel.setShowBadge(false);
+                              nm.createNotificationChannel(channel);
+                          }
+
+                          Intent openIntent = new Intent(this, MainActivity.class);
+                          int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) { flags |= PendingIntent.FLAG_IMMUTABLE; }
+                          PendingIntent pi = PendingIntent.getActivity(this, 0, openIntent, flags);
+
+                          Notification.Builder builder = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ?
+                                  new Notification.Builder(this, CANAL_ID) : new Notification.Builder(this);
+
+                          Notification notif = builder
+                                  .setContentTitle("Monitor Ativo")
+                                  .setContentText("Sincronizado em tempo real")
+                                  .setSmallIcon(android.R.drawable.ic_dialog_info)
+                                  .setContentIntent(pi)
+                                  .setOngoing(true)
+                                  .build();
+
+                          startForeground(1001, notif);
+                      } catch (Throwable ignored) {}
+                  }
+
+                  private void ativarWakeLock() {
+                      try {
+                          PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                          if (pm != null && wakeLock == null) {
+                              wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MonitorDados::SempreAtivoLock");
+                              wakeLock.setReferenceCounted(false);
+                              wakeLock.acquire();
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+
+                  @Override
+                  public void onDestroy() {
+                      if (wakeLock != null && wakeLock.isHeld()) {
+                          try { wakeLock.release(); } catch (Throwable ignored) {}
+                      }
+                      super.onDestroy();
+                  }
+
+                  @Override
+                  public IBinder onBind(Intent intent) { return null; }
+              }
+
+              public static class FirewallVpnService extends VpnService {
+                  private static ParcelFileDescriptor vpnInterface = null;
+                  public static volatile boolean bloqueioGeralAtivo = false;
+                  public static final List<String> listaAppsBloqueados = new ArrayList<>();
+
+                  @Override
+                  public int onStartCommand(Intent intent, int flags, int startId) {
+                      if (intent != null && "PARAR".equals(intent.getAction())) {
+                          fecharTunel();
+                          stopSelf();
+                          return START_NOT_STICKY;
+                      }
+                      aplicarRegrasVpn();
+                      return START_STICKY;
+                  }
+
+                  private synchronized void aplicarRegrasVpn() {
+                      fecharTunel();
+                      if (!bloqueioGeralAtivo && listaAppsBloqueados.isEmpty()) {
+                          stopSelf();
+                          return;
+                      }
+                      try {
+                          Builder builder = new Builder();
+                          builder.setSession("Firewall Central Monitor");
+                          builder.setMtu(1500);
+                          builder.addAddress("10.111.222.1", 32);
+                          builder.addRoute("0.0.0.0", 0);
+                          builder.addDnsServer("10.111.222.2");
+
+                          try {
+                              builder.addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128);
+                              builder.addRoute("::", 0);
+                          } catch (Throwable ignored) {}
+
+                          if (bloqueioGeralAtivo) {
+                              try { builder.addDisallowedApplication(getPackageName()); } catch (Throwable ignored) {}
+                          } else {
+                              int adicionados = 0;
+                              for (String pkg : listaAppsBloqueados) {
+                                  if (pkg != null && !pkg.trim().isEmpty() && !pkg.equals(getPackageName())) {
+                                      try { builder.addAllowedApplication(pkg.trim()); adicionados++; } catch (Throwable ignored) {}
+                                  }
+                              }
+                              if (adicionados == 0) { stopSelf(); return; }
+                          }
+                          vpnInterface = builder.establish();
+                      } catch (Throwable e) { fecharTunel(); }
+                  }
+
+                  private synchronized void fecharTunel() {
+                      if (vpnInterface != null) {
+                          try { vpnInterface.close(); } catch (IOException ignored) {}
+                          vpnInterface = null;
+                      }
+                  }
+
+                  @Override
+                  public void onDestroy() {
+                      fecharTunel();
+                      super.onDestroy();
+                  }
+              }
+
+              public static class PonteMonitorDados {
+                  private final Context context;
+
+                  public PonteMonitorDados(Context context) {
+                      this.context = context.getApplicationContext();
+                  }
+
+                  @JavascriptInterface
+                  public boolean temPermissaoUso() {
+                      try {
+                          AppOpsManager appOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+                          if (appOps == null) return false;
+                          int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), context.getPackageName());
+                          return mode == AppOpsManager.MODE_ALLOWED;
+                      } catch (Throwable e) { return false; }
+                  }
+
+                  @JavascriptInterface
+                  public void solicitarPermissaoUso() {
+                      try {
+                          Intent intent = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+                          intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          context.startActivity(intent);
+                      } catch (Throwable ignored) {}
+                  }
+
+                  @JavascriptInterface
+                  public boolean temPermissaoVpn() {
+                      try { return VpnService.prepare(context) == null; } catch (Throwable e) { return false; }
+                  }
+
+                  @JavascriptInterface
+                  public void solicitarPermissaoVpn() {
+                      try {
+                          if (instanciaAtiva != null) {
+                              Intent vpnIntent = VpnService.prepare(instanciaAtiva);
+                              if (vpnIntent != null) { instanciaAtiva.startActivityForResult(vpnIntent, REQ_VPN); }
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+
+                  @JavascriptInterface
+                  public void sincronizarFirewallVpn(boolean bloquearGeral, String pacotesJsonArray) {
+                      try {
+                          FirewallVpnService.bloqueioGeralAtivo = bloquearGeral;
+                          synchronized (FirewallVpnService.listaAppsBloqueados) {
+                              FirewallVpnService.listaAppsBloqueados.clear();
+                              if (pacotesJsonArray != null && !pacotesJsonArray.isEmpty()) {
+                                  JSONArray arr = new JSONArray(pacotesJsonArray);
+                                  for (int i = 0; i < arr.length(); i++) {
+                                      String pkg = arr.optString(i, "");
+                                      if (!pkg.isEmpty()) { FirewallVpnService.listaAppsBloqueados.add(pkg); }
+                                  }
+                              }
+                          }
+
+                          boolean precisaAtivar = bloquearGeral || !FirewallVpnService.listaAppsBloqueados.isEmpty();
+                          if (!precisaAtivar) {
+                              Intent stopIntent = new Intent(context, FirewallVpnService.class);
+                              stopIntent.setAction("PARAR");
+                              context.startService(stopIntent);
+                              return;
+                          }
+
+                          Intent prepareIntent = VpnService.prepare(context);
+                          if (prepareIntent != null) {
+                              if (instanciaAtiva != null) { instanciaAtiva.startActivityForResult(prepareIntent, REQ_VPN); }
+                          } else {
+                              Intent startIntent = new Intent(context, FirewallVpnService.class);
+                              startIntent.setAction("ATUALIZAR");
+                              context.startService(startIntent);
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+
+                  @JavascriptInterface
+                  public double obterConsumoTotalMesGB(int diaRenovacao) {
+                      long inicio = calcularInicioCiclo(diaRenovacao);
+                      long agora = System.currentTimeMillis();
+                      long totalBytes = 0;
+                      try {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && temPermissaoUso()) {
+                              NetworkStatsManager nsm = (NetworkStatsManager) context.getSystemService(Context.NETWORK_STATS_SERVICE);
+                              if (nsm != null) {
+                                  NetworkStats.Bucket bucket = nsm.querySummaryForDevice(ConnectivityManager.TYPE_MOBILE, null, inicio, agora);
+                                  if (bucket != null) { totalBytes = bucket.getRxBytes() + bucket.getTxBytes(); }
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+
+                      if (totalBytes <= 0) {
+                          long rx = TrafficStats.getMobileRxBytes();
+                          long tx = TrafficStats.getMobileTxBytes();
+                          if (rx != TrafficStats.UNSUPPORTED && tx != TrafficStats.UNSUPPORTED) { totalBytes = rx + tx; }
+                      }
+                      return totalBytes / (1024.0 * 1024.0 * 1024.0);
+                  }
+
+                  @JavascriptInterface
+                  public String obterTipoRede() {
+                      try {
+                          ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                          if (cm == null) return "Desconectado";
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                              Network net = cm.getActiveNetwork();
+                              if (net == null) return "Dados Desligados";
+                              NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+                              if (caps == null) return "Dados Desligados";
+                              if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) { return "Wi-Fi Ativo"; }
+                              else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) { return "4G/5G Móvel"; }
+                          }
+                      } catch (Throwable ignored) {}
+                      return "Dados Móveis";
+                  }
+
+                  @JavascriptInterface
+                  public String obterInfoRedeEGeoJSON() {
+                      JSONObject json = new JSONObject();
+                      try {
+                          String redeAtiva = obterTipoRede();
+                          String operadora = "Rede Móvel";
+                          TelephonyManager tm = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+                          if (tm != null && tm.getNetworkOperatorName() != null && !tm.getNetworkOperatorName().isEmpty()) {
+                              operadora = tm.getNetworkOperatorName();
+                          }
+                          double lat = 0.0, lon = 0.0;
+                          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                                  context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                              LocationManager lm = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
+                              if (lm != null) {
+                                  Location loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                                  if (loc == null) { loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER); }
+                                  if (loc != null) { lat = loc.getLatitude(); lon = loc.getLongitude(); }
+                              }
+                          }
+                          json.put("redeAtiva", redeAtiva);
+                          json.put("operadora", operadora);
+                          json.put("latitude", lat);
+                          json.put("longitude", lon);
+                      } catch (Throwable ignored) {}
+                      return json.toString();
+                  }
+
+                  @JavascriptInterface
+                  public String obterAppsInstaladosJSON(int diaRenovacao) {
+                      JSONArray listaApps = new JSONArray();
+                      try {
+                          PackageManager pm = context.getPackageManager();
+                          String redeAtual = obterTipoRede();
+                          List<PackageInfo> pacotes = pm.getInstalledPackages(PackageManager.GET_PERMISSIONS);
+                          List<JSONObject> tempObjs = new ArrayList<>();
+
+                          for (PackageInfo pkg : pacotes) {
+                              ApplicationInfo appInfo = pkg.applicationInfo;
+                              if (appInfo == null) continue;
+                              boolean ehAppUsuario = (appInfo.flags & ApplicationInfo.FLAG_SYSTEM) == 0
+                                      || (appInfo.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                                      || pm.getLaunchIntentForPackage(pkg.packageName) != null;
+                              if (!ehAppUsuario) continue;
+
+                              int uid = appInfo.uid;
+                              String nomeApp = pm.getApplicationLabel(appInfo).toString();
+                              long rxUid = TrafficStats.getUidRxBytes(uid);
+                              long txUid = TrafficStats.getUidTxBytes(uid);
+                              long totalBytes = (rxUid > 0 || txUid > 0) ? (rxUid + txUid) : 0;
+
+                              boolean solicitaGeo = false;
+                              if (pkg.requestedPermissions != null) {
+                                  for (String perm : pkg.requestedPermissions) {
+                                      if (Manifest.permission.ACCESS_FINE_LOCATION.equals(perm)) { solicitaGeo = true; break; }
+                                  }
+                              }
+
+                              double totalMB = totalBytes / (1024.0 * 1024.0);
+                              JSONObject obj = new JSONObject();
+                              obj.put("nome", nomeApp);
+                              obj.put("pacote", pkg.packageName);
+                              obj.put("totalMB", Math.round(totalMB * 100.0) / 100.0);
+                              obj.put("redeAtiva", "Conectado (" + redeAtual + ")");
+                              obj.put("emTransmissao", totalMB > 0);
+                              obj.put("usaGeo", solicitaGeo);
+                              obj.put("geoAtiva", solicitaGeo);
+                              tempObjs.add(obj);
+                          }
+
+                          Collections.sort(tempObjs, new Comparator<JSONObject>() {
+                              @Override
+                              public int compare(JSONObject a, JSONObject b) {
+                                  return Double.compare(b.optDouble("totalMB", 0), a.optDouble("totalMB", 0));
+                              }
+                          });
+
+                          int limite = Math.min(tempObjs.size(), 40);
+                          for (int i = 0; i < limite; i++) { listaApps.put(tempObjs.get(i)); }
+                      } catch (Throwable ignored) {}
+                      return listaApps.toString();
+                  }
+
+                  @JavascriptInterface
+                  public double obterVelocidadeMbps() {
+                      long agora = System.currentTimeMillis();
+                      long rxAtual = TrafficStats.getTotalRxBytes();
+                      long txAtual = TrafficStats.getTotalTxBytes();
+                      if (ultimoTempoLeitura > 0 && (agora - ultimoTempoLeitura) > 500) {
+                          long deltaBytes = (rxAtual - ultimoRxBytesTotal) + (txAtual - ultimoTxBytesTotal);
+                          double segundos = (agora - ultimoTempoLeitura) / 1000.0;
+                          if (deltaBytes >= 0 && segundos > 0) {
+                              double mbpsInstantaneo = (deltaBytes * 8.0) / (segundos * 1000000.0);
+                              if (mbpsInstantaneo > 0.05) { ultimaVelocidadeMbps = mbpsInstantaneo; }
+                          }
+                      }
+                      ultimoRxBytesTotal = rxAtual;
+                      ultimoTxBytesTotal = txAtual;
+                      ultimoTempoLeitura = agora;
+                      return Math.round(ultimaVelocidadeMbps * 100.0) / 100.0;
+                  }
+
+                  @JavascriptInterface
+                  public int obterLatenciaMs() { return ultimaLatenciaMs; }
+
+                  @JavascriptInterface
+                  public void dispararMedicaoEmSegundoPlano() {
+                      new Thread(new Runnable() {
+                          @Override
+                          public void run() {
+                              try {
+                                  long t0 = System.currentTimeMillis();
+                                  HttpURLConnection conn = (HttpURLConnection) new URL("https://www.google.com/generate_204").openConnection();
+                                  conn.setConnectTimeout(3000);
+                                  conn.setReadTimeout(3000);
+                                  conn.setRequestMethod("HEAD");
+                                  conn.getResponseCode();
+                                  long t1 = System.currentTimeMillis();
+                                  ultimaLatenciaMs = (int) (t1 - t0);
+                                  conn.disconnect();
+                              } catch (Throwable e) { ultimaLatenciaMs = 0; }
+                          }
+                      }).start();
+                  }
+              }
+          }
           EOF
 
           echo "sdk.dir=$HOME/android-sdk" > local.properties
@@ -164,8 +754,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 23
                   targetSdk 33
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "2.0"
               }
               buildTypes {
                   debug {
