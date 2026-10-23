@@ -19,11 +19,16 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. Baixar e Configurar Android SDK
+      - name: 3. Instalar Gradle 7.6.4 e Configurar Android SDK
         run: |
+          # Transfere e extrai o Gradle 7.6.4 isolado para não usar o Gradle 9 do sistema
+          curl -sL https://services.gradle.org/distributions/gradle-7.6.4-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+
+          # Configura o Android SDK
           mkdir -p $HOME/android-sdk/cmdline-tools
           cd $HOME/android-sdk/cmdline-tools
-          curl -s https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o commandlinetools.zip
+          curl -sL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o commandlinetools.zip
           unzip -q commandlinetools.zip
           mkdir -p latest
           mv cmdline-tools/* latest/ 2>/dev/null || true
@@ -46,6 +51,8 @@ jobs:
           if [ -f "central.html" ] && [ ! -f "app/src/main/assets/central.html" ]; then
             cp central.html app/src/main/assets/central.html
           fi
+
+          echo "sdk.dir=$HOME/android-sdk" > local.properties
 
           cat << 'EOF' > settings.gradle
           pluginManagement {
@@ -102,7 +109,7 @@ jobs:
       - name: 5. Compilar APK 1 - Monitor de Dados
         run: |
           export ANDROID_HOME=$HOME/android-sdk
-          gradle assembleDebug --no-daemon
+          /tmp/gradle-7.6.4/bin/gradle assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk APKs-Prontos/Monitor-Dados.apk
 
       - name: 6. Compilar APK 2 - Painel Central
@@ -115,7 +122,7 @@ jobs:
           sed -i 's/android:label="Monitor de Dados"/android:label="Painel Central"/g' app/src/main/AndroidManifest.xml
 
           export ANDROID_HOME=$HOME/android-sdk
-          gradle assembleDebug --no-daemon
+          /tmp/gradle-7.6.4/bin/gradle assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk APKs-Prontos/Painel-Central.apk
 
       - name: 7. Publicar os 2 APKs para Download
