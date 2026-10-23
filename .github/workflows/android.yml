@@ -116,6 +116,7 @@ jobs:
               </application>
           </manifest>
           EOF
+          sed -i 's/^          //' app/src/main/AndroidManifest.xml
 
           # ===================================================================
           # 2. MAINACTIVITY.JAVA COMPLETO (24H ATIVO + VPN FIREWALL + BOOT)
@@ -1007,7 +1008,8 @@ jobs:
 
               function salvarConfiguracoes() {
                 planoGB = parseFloat(document.getElementById('selectPlano').value) || 0;
-                diaCiclo = parseInt(document.getElementById('inputDiaCiclo').value || '1', 10) || 1;
+                diaCiclo = Math.max(1, Math.min(28, parseInt(document.getElementById('inputDiaCiclo').value || '1', 10) || 1));
+                document.getElementById('inputDiaCiclo').value = String(diaCiclo);
                 salvarDado('planoGB', planoGB);
                 salvarDado('diaCiclo', diaCiclo);
                 atualizarPainelLocal();
@@ -1065,7 +1067,7 @@ jobs:
                   var pct = Math.min(100, (consumoLiquido / planoGB) * 100);
                   var restante = Math.max(0, planoGB - consumoLiquido);
                   document.getElementById('labelPlanoAtivo').textContent = 'Franquia ' + planoGB + ' GB';
-                  document.getElementById('textoStatusFranquia').textContent = pct.toFixed(1) + '% usado • Restam ' + restante.toFixed(2) + ' GB';
+                  document.getElementById('textoStatusFranquia').textContent = pct.toFixed(1) + '% usado • Restam ' + restante.toFixed(2) + ' GB (Dia ' + diaCiclo + ')';
                   barra.style.width = pct + '%';
                   alerta.style.display = pct >= 80 ? 'block' : 'none';
                   alerta.style.background = pct >= 90 ? 'rgba(239,68,68,0.2)' : 'rgba(245,158,11,0.2)';
@@ -1164,6 +1166,28 @@ jobs:
                           salvarDado('appsBloqueados_v7', JSON.stringify(appsBloqueadosMap));
                           atualizarInterfaceFirewall();
                         }
+                        if (cmd.acao === 'CONFIG_PLANO') {
+                          if (cmd.planoGB !== undefined) {
+                            planoGB = parseFloat(cmd.planoGB) || 0;
+                            salvarDado('planoGB', planoGB);
+                            document.getElementById('selectPlano').value = String(planoGB);
+                          }
+                          if (cmd.diaCiclo !== undefined) {
+                            diaCiclo = Math.max(1, Math.min(28, parseInt(cmd.diaCiclo, 10) || 1));
+                            salvarDado('diaCiclo', diaCiclo);
+                            document.getElementById('inputDiaCiclo').value = String(diaCiclo);
+                          }
+                          if (cmd.zerarHoje) {
+                            offsetZeroGB = ultimoConsumoBrutoGB;
+                            salvarDado('offsetZeroGB', offsetZeroGB);
+                          }
+                          atualizarPainelLocal();
+                          carregarAppsInstalados();
+                          enviarPacoteAutomatico();
+                        }
+                        if (cmd.acao === 'ZERAR_CONTADOR') {
+                          zerarContadorManual();
+                        }
                       } catch (e) {}
                     });
                   }
@@ -1179,7 +1203,7 @@ jobs:
 
                 var pacote = {
                   deviceId: deviceId, nome: nomeAparelho, timestamp: Date.now(), consumoGB: Number(consumoLiquido.toFixed(2)),
-                  planoGB: planoGB, rede: firewallGeralAtivo ? '🛡️ Apps Bloqueados' : estadoLocal.rede, dadosDesligados: firewallGeralAtivo,
+                  planoGB: planoGB, diaCiclo: diaCiclo, rede: firewallGeralAtivo ? '🛡️ Apps Bloqueados' : estadoLocal.rede, dadosDesligados: firewallGeralAtivo,
                   appsBloqueadosMap: appsBloqueadosMap, velocidade: firewallGeralAtivo ? 0 : Number(Number(estadoLocal.velocidade || 0).toFixed(1)),
                   latencia: firewallGeralAtivo ? 0 : estadoLocal.latencia, cidade: estadoLocal.cidade, operadora: estadoLocal.operadora,
                   lat: Number(Number(estadoLocal.lat || -3.7361).toFixed(5)), lon: Number(Number(estadoLocal.lon || -38.6531).toFixed(5)), apps: appsCompactados
@@ -1205,7 +1229,7 @@ jobs:
           EOF
 
           # ===================================================================
-          # 4. CENTRAL.HTML COMPLETO (APP 2 - PAINEL CENTRAL)
+          # 4. CENTRAL.HTML COMPLETO (APP 2 - PAINEL CENTRAL COM PLANO/CICLO)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/central.html
           <!DOCTYPE html>
@@ -1234,7 +1258,9 @@ jobs:
               .metric-box { background: var(--card-dark); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
               .metric-label { font-size: 0.72rem; color: var(--muted); }
               .metric-val { font-size: 1rem; font-weight: 700; margin-top: 3px; color: var(--text); }
-              button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--text); font-size: 0.88rem; margin-top: 6px; font-weight: 700; cursor: pointer; }
+              select, input, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--text); font-size: 0.88rem; margin-top: 6px; }
+              button { font-weight: 700; cursor: pointer; }
+              button.btn-primary { background: var(--primary); color: #082f49; border: none; }
               button.btn-sec { background: #1e293b; color: var(--text); }
               button.btn-danger { background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid var(--danger); }
               button.btn-success { background: rgba(34,197,94,0.2); color: #4ade80; border: 1px solid var(--success); }
@@ -1267,6 +1293,7 @@ jobs:
               .device-actions button { padding: 8px; font-size: 0.8rem; margin-top: 0; }
               .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.82); z-index: 1000; padding: 12px; overflow-y: auto; }
               .modal-box { background: var(--card); border: 1px solid var(--primary); border-radius: 14px; padding: 14px; max-width: 600px; margin: 10px auto; }
+              .config-remota-box { background: var(--card-dark); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
             </style>
           </head>
           <body>
@@ -1300,16 +1327,46 @@ jobs:
                   <span id="modalTituloAparelho" style="color:var(--primary); font-size:0.95rem;">Detalhes do Aparelho</span>
                   <button class="filtro-btn" onclick="fecharModalRemoto()">✖ Fechar</button>
                 </div>
+
                 <div class="grid-2" style="margin-bottom: 10px;">
-                  <div class="metric-box"><div class="metric-label">Consumo / Plano</div><div class="metric-val" id="modalConsumoPlano">--</div></div>
+                  <div class="metric-box"><div class="metric-label">Consumo / Plano</div><div class="metric-val" id="modalConsumoPlano" style="font-size:0.9rem;">--</div></div>
                   <div class="metric-box"><div class="metric-label">Rede Ativa / Ping</div><div class="metric-val" id="modalRedePing" style="font-size:0.88rem;">--</div></div>
                   <div class="metric-box"><div class="metric-label">Localizacao / Cidade</div><div class="metric-val" id="modalCidadeOp" style="font-size:0.85rem;">--</div></div>
                   <div class="metric-box"><div class="metric-label">Coordenadas GPS</div><div class="metric-val" id="modalCoordsGps" style="font-size:0.82rem;">--</div></div>
                 </div>
+
+                <div class="config-remota-box">
+                  <div class="card-title" style="margin-bottom: 6px;">
+                    <span>⚙️ Configurar Plano e Ciclo Remotamente</span>
+                    <span id="statusSalvoRemoto" style="color:var(--success); font-size:0.72rem;"></span>
+                  </div>
+                  <div class="grid-2">
+                    <div>
+                      <label class="metric-label">Franquia do Plano:</label>
+                      <select id="modalSelectPlano">
+                        <option value="0">♾️ Ilimitado</option>
+                        <option value="43">43 GB</option>
+                        <option value="48">48 GB</option>
+                        <option value="91">91 GB</option>
+                        <option value="134">134 GB</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label class="metric-label">Dia de Renovacao (1-28):</label>
+                      <input type="number" id="modalInputDiaCiclo" min="1" max="28" value="1" />
+                    </div>
+                  </div>
+                  <div class="grid-2" style="margin-top: 8px;">
+                    <button class="btn-primary" style="margin-top:0;" onclick="salvarPlanoCicloRemoto()">💾 Salvar no Aparelho</button>
+                    <button class="btn-sec" style="margin-top:0;" onclick="zerarContadorRemoto()">🔄 Zerar Contador Hoje</button>
+                  </div>
+                </div>
+
                 <div class="grid-2" style="margin-bottom: 12px;">
                   <button id="btnAbrirMapaModal" class="btn-sec" style="margin-top:0;">🗺️ Abrir no Mapa</button>
                   <button id="btnToggleDadosModal" class="btn-danger" style="margin-top:0;">🛡️ Bloquear Todos</button>
                 </div>
+
                 <div class="card-title">
                   <span>📱 Controle de Internet por Aplicativo</span>
                   <span id="modalContadorApps">0 apps</span>
@@ -1350,7 +1407,7 @@ jobs:
                 salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
                 renderizarFrota();
                 document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
-                if (aparelhoRemotoSelecionado === payload.deviceId) { preencherModalRemoto(payload); }
+                if (aparelhoRemotoSelecionado === payload.deviceId) { preencherModalRemoto(payload, true); }
               }
 
               function conectarMqttCentral() {
@@ -1371,6 +1428,62 @@ jobs:
                     } catch (e) {}
                   });
                 } catch (e) {}
+              }
+
+              function salvarPlanoCicloRemoto() {
+                if (!aparelhoRemotoSelecionado) return;
+                var d = frotaAparelhos[aparelhoRemotoSelecionado];
+                if (!d) return;
+
+                var novoPlano = parseFloat(document.getElementById('modalSelectPlano').value) || 0;
+                var novoDia = Math.max(1, Math.min(28, parseInt(document.getElementById('modalInputDiaCiclo').value || '1', 10) || 1));
+                document.getElementById('modalInputDiaCiclo').value = String(novoDia);
+
+                d.planoGB = novoPlano;
+                d.diaCiclo = novoDia;
+
+                var comando = {
+                  deviceId: d.deviceId,
+                  acao: 'CONFIG_PLANO',
+                  planoGB: novoPlano,
+                  diaCiclo: novoDia,
+                  timestamp: Date.now()
+                };
+
+                registrarAparelhoNaTela(d);
+
+                if (clientMqtt && clientMqtt.connected) {
+                  clientMqtt.publish(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
+                  clientMqtt.publish(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
+                }
+
+                var av = document.getElementById('statusSalvoRemoto');
+                av.textContent = '✅ Enviado!';
+                setTimeout(function() { av.textContent = ''; }, 2500);
+              }
+
+              function zerarContadorRemoto() {
+                if (!aparelhoRemotoSelecionado) return;
+                var d = frotaAparelhos[aparelhoRemotoSelecionado];
+                if (!d) return;
+
+                d.consumoGB = 0;
+                var comando = {
+                  deviceId: d.deviceId,
+                  acao: 'ZERAR_CONTADOR',
+                  timestamp: Date.now()
+                };
+
+                registrarAparelhoNaTela(d);
+
+                if (clientMqtt && clientMqtt.connected) {
+                  clientMqtt.publish(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
+                  clientMqtt.publish(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
+                }
+
+                var av = document.getElementById('statusSalvoRemoto');
+                av.textContent = '✅ Contador zerado!';
+                setTimeout(function() { av.textContent = ''; }, 2500);
               }
 
               function alternarFirewallGeralAparelho(id) {
@@ -1429,7 +1542,7 @@ jobs:
                 var idSim = 'CEL-' + Math.floor(Math.random() * 900 + 100);
                 var pacoteTeste = {
                   deviceId: idSim, nome: modelos[Math.floor(Math.random() * modelos.length)] + ' • ' + idSim, timestamp: Date.now(),
-                  consumoGB: 5.2, planoGB: 43, rede: '5G Ativo (Vivo)', dadosDesligados: false, appsBloqueadosMap: {}, velocidade: 45.5, latencia: 18,
+                  consumoGB: 5.2, planoGB: 43, diaCiclo: 10, rede: '5G Ativo (Vivo)', dadosDesligados: false, appsBloqueadosMap: {}, velocidade: 45.5, latencia: 18,
                   cidade: 'Caucaia - CE', operadora: 'Vivo', lat: -3.7361, lon: -38.6531,
                   apps: [
                     { nome: 'WhatsApp', pacote: 'com.whatsapp', totalMB: 1420.5, redeAtiva: 'Transmitindo', emTransmissao: true, usaGeo: true, geoAtiva: true, bloqueado: false },
@@ -1470,16 +1583,17 @@ jobs:
                   var qtdBloqIndiv = (item.apps || []).filter(function(a) { return a.bloqueado; }).length;
                   var tempoTexto = bloqueado ? 'Apps Bloqueados' : (isOnline ? 'Online agora' : 'Offline');
 
+                  var txtPlanoCard = Number(item.planoGB || 0) > 0 ? (item.planoGB + ' GB • Dia ' + (item.diaCiclo || 1)) : ('Ilimitado • Dia ' + (item.diaCiclo || 1));
                   var btnAppsHtml = bloqueado ? '<button class="btn-success" onclick="alternarFirewallGeralAparelho(\'' + item.deviceId + '\')">🟢 Liberar Apps</button>' : '<button class="btn-danger" onclick="alternarFirewallGeralAparelho(\'' + item.deviceId + '\')">🛡️ Bloquear Apps</button>';
                   var tagAppsInfo = qtdBloqIndiv > 0 ? '<span class="tag tag-net-block">🚫 ' + qtdBloqIndiv + ' apps bloqueados</span>' : '<span class="tag tag-net-on">📦 Apps liberados</span>';
 
                   return '<div class="device-card ' + (bloqueado ? 'bloqueado' : '') + '">' +
-                    '<div class="device-header"><div><div class="device-name">📱 ' + item.nome + '</div><div class="app-pkg">ID: ' + item.deviceId + '</div></div>' +
+                    '<div class="device-header"><div><div class="device-name">📱 ' + item.nome + '</div><div class="app-pkg">ID: ' + item.deviceId + ' • Plano: ' + txtPlanoCard + '</div></div>' +
                     '<span class="status-dot ' + (bloqueado ? 'status-blocked' : (isOnline ? 'status-online' : 'status-offline')) + '">' + tempoTexto + '</span></div>' +
                     '<div class="grid-2"><div class="metric-box"><div class="metric-label">Consumo</div><div class="metric-val" style="color:var(--primary);">' + Number(item.consumoGB || 0).toFixed(2) + ' GB</div></div>' +
                     '<div class="metric-box"><div class="metric-label">Rede</div><div class="metric-val" style="font-size:0.88rem;">' + item.rede + '</div></div></div>' +
                     '<div class="app-badges" style="margin-top: 8px;"><span class="tag tag-geo-on">📍 ' + item.cidade + '</span>' + tagAppsInfo + '</div>' +
-                    '<div class="device-actions"><button onclick="abrirModalRemoto(\'' + item.deviceId + '\')">🔍 Gerenciar Apps</button>' + btnAppsHtml + '</div></div>';
+                    '<div class="device-actions"><button onclick="abrirModalRemoto(\'' + item.deviceId + '\')">🔍 Gerenciar Apps / Plano</button>' + btnAppsHtml + '</div></div>';
                 }).join('');
               }
 
@@ -1488,16 +1602,22 @@ jobs:
                 if (!dados) return;
                 aparelhoRemotoSelecionado = id;
                 filtroModalRemoto = 'todos';
-                preencherModalRemoto(dados);
+                preencherModalRemoto(dados, false);
                 document.getElementById('modalAparelhoRemoto').style.display = 'block';
               }
 
-              function preencherModalRemoto(d) {
+              function preencherModalRemoto(d, manterInputsAbertos) {
                 document.getElementById('modalTituloAparelho').textContent = '📱 ' + d.nome;
-                document.getElementById('modalConsumoPlano').textContent = Number(d.consumoGB || 0).toFixed(2) + ' GB';
+                var txtPlano = Number(d.planoGB || 0) > 0 ? (d.planoGB + ' GB') : 'Ilimitado';
+                document.getElementById('modalConsumoPlano').textContent = Number(d.consumoGB || 0).toFixed(2) + ' GB / ' + txtPlano + ' (Dia ' + (d.diaCiclo || 1) + ')';
                 document.getElementById('modalRedePing').textContent = d.rede + ' • ' + d.latencia + ' ms';
                 document.getElementById('modalCidadeOp').textContent = d.cidade + ' (' + d.operadora + ')';
                 document.getElementById('modalCoordsGps').textContent = Number(d.lat || 0).toFixed(4) + ', ' + Number(d.lon || 0).toFixed(4);
+
+                if (!manterInputsAbertos) {
+                  document.getElementById('modalSelectPlano').value = String(d.planoGB || 0);
+                  document.getElementById('modalInputDiaCiclo').value = String(d.diaCiclo || 1);
+                }
 
                 document.getElementById('btnAbrirMapaModal').onclick = function() {
                   if (d.lat && d.lon) { window.open('https://www.google.com/maps?q=' + d.lat + ',' + d.lon, '_blank'); }
@@ -1596,8 +1716,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 23
                   targetSdk 33
-                  versionCode 4
-                  versionName "4.0"
+                  versionCode 5
+                  versionName "5.0"
               }
               buildTypes {
                   debug {
