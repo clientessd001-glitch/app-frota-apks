@@ -119,7 +119,7 @@ jobs:
           sed -i 's/^          //' app/src/main/AndroidManifest.xml
 
           # ===================================================================
-          # 2. MAINACTIVITY.JAVA COMPLETO (24H ATIVO + VPN FIREWALL + BOOT)
+          # 2. MAINACTIVITY.JAVA COMPLETO (COM MUTABLECONTEXTWRAPPER + MAPS + VPN)
           # ===================================================================
           cat << 'EOF' > app/src/main/java/com/example/monitordados/MainActivity.java
           package com.example.monitordados;
@@ -137,6 +137,7 @@ jobs:
           import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
+          import android.content.MutableContextWrapper;
           import android.content.pm.ApplicationInfo;
           import android.content.pm.PackageInfo;
           import android.content.pm.PackageManager;
@@ -163,6 +164,7 @@ jobs:
           import android.webkit.GeolocationPermissions;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
@@ -184,6 +186,7 @@ jobs:
               private static final int REQ_PERMISSOES = 101;
               private static final int REQ_VPN = 102;
 
+              public static MutableContextWrapper contextWrapperGlobal = null;
               public static WebViewSempreAtivo webViewGlobal = null;
               public static MainActivity instanciaAtiva = null;
 
@@ -203,20 +206,61 @@ jobs:
                   }
               }
 
+              private static boolean tratarUrlExterna(Context ctx, String url) {
+                  if (url == null || url.isEmpty()) return false;
+                  if (url.startsWith("file:///")) return false;
+
+                  try {
+                      if (url.startsWith("intent://")) {
+                          Intent intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
+                          if (intent != null) {
+                              intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                              try {
+                                  ctx.startActivity(intent);
+                                  return true;
+                              } catch (Throwable e) {
+                                  String fallbackUrl = intent.getStringExtra("browser_fallback_url");
+                                  if (fallbackUrl != null && !fallbackUrl.isEmpty()) {
+                                      Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(fallbackUrl));
+                                      browserIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                      ctx.startActivity(browserIntent);
+                                      return true;
+                              }
+                          }
+                          }
+                          return true;
+                      }
+
+                      if (url.startsWith("geo:") || url.contains("google.com/maps")) {
+                          Intent mapIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                          mapIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          ctx.startActivity(mapIntent);
+                          return true;
+                      }
+                  } catch (Throwable ignored) {}
+                  return false;
+              }
+
               public static synchronized void garantirMotorWebAtivo(final Context context) {
                   final Context appCtx = context.getApplicationContext();
                   if (Looper.myLooper() != Looper.getMainLooper()) {
                       new Handler(Looper.getMainLooper()).post(new Runnable() {
                           @Override
                           public void run() {
-                              garantirMotorWebAtivo(appCtx);
+                              garantirMotorWebAtivo(context);
                           }
                       });
                       return;
                   }
 
+                  if (contextWrapperGlobal == null) {
+                      contextWrapperGlobal = new MutableContextWrapper(context instanceof Activity ? context : appCtx);
+                  } else if (context instanceof Activity) {
+                      contextWrapperGlobal.setBaseContext(context);
+                  }
+
                   if (webViewGlobal == null) {
-                      webViewGlobal = new WebViewSempreAtivo(appCtx);
+                      webViewGlobal = new WebViewSempreAtivo(contextWrapperGlobal);
                       WebSettings settings = webViewGlobal.getSettings();
                       settings.setJavaScriptEnabled(true);
                       settings.setDomStorageEnabled(true);
@@ -226,7 +270,21 @@ jobs:
                           settings.setMediaPlaybackRequiresUserGesture(false);
                       }
 
-                      webViewGlobal.setWebViewClient(new WebViewClient());
+                      webViewGlobal.setWebViewClient(new WebViewClient() {
+                          @Override
+                          public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                              return tratarUrlExterna(appCtx, url);
+                          }
+
+                          @Override
+                          public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && request != null && request.getUrl() != null) {
+                                  return tratarUrlExterna(appCtx, request.getUrl().toString());
+                              }
+                              return false;
+                          }
+                      });
+
                       webViewGlobal.setWebChromeClient(new WebChromeClient() {
                           @Override
                           public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback callback) {
@@ -263,6 +321,9 @@ jobs:
                   instanciaAtiva = this;
 
                   garantirMotorWebAtivo(this);
+                  if (contextWrapperGlobal != null) {
+                      contextWrapperGlobal.setBaseContext(this);
+                  }
                   if (webViewGlobal.getParent() != null) {
                       ((ViewGroup) webViewGlobal.getParent()).removeView(webViewGlobal);
                   }
@@ -276,6 +337,9 @@ jobs:
               protected void onResume() {
                   super.onResume();
                   instanciaAtiva = this;
+                  if (contextWrapperGlobal != null) {
+                      contextWrapperGlobal.setBaseContext(this);
+                  }
                   if (webViewGlobal != null) {
                       webViewGlobal.onResume();
                       webViewGlobal.resumeTimers();
@@ -293,11 +357,18 @@ jobs:
 
               @Override
               public void onBackPressed() {
+                  if (webViewGlobal != null && webViewGlobal.canGoBack()) {
+                      webViewGlobal.goBack();
+                      return;
+                  }
                   moveTaskToBack(true);
               }
 
               @Override
               protected void onDestroy() {
+                  if (contextWrapperGlobal != null) {
+                      contextWrapperGlobal.setBaseContext(getApplicationContext());
+                  }
                   if (webViewGlobal != null && webViewGlobal.getParent() != null) {
                       ((ViewGroup) webViewGlobal.getParent()).removeView(webViewGlobal);
                   }
@@ -519,6 +590,28 @@ jobs:
 
                   public PonteMonitorDados(Context context) {
                       this.context = context.getApplicationContext();
+                  }
+
+                  @JavascriptInterface
+                  public void abrirMapaNativo(double lat, double lon, String rotulo) {
+                      try {
+                          String labelLimpo = (rotulo != null && !rotulo.isEmpty()) ? Uri.encode(rotulo) : "Aparelho";
+                          Uri geoUri = Uri.parse("geo:" + lat + "," + lon + "?q=" + lat + "," + lon + "(" + labelLimpo + ")");
+                          Intent mapIntent = new Intent(Intent.ACTION_VIEW, geoUri);
+                          mapIntent.setPackage("com.google.android.apps.maps");
+                          mapIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          if (mapIntent.resolveActivity(context.getPackageManager()) != null) {
+                              context.startActivity(mapIntent);
+                              return;
+                          }
+                      } catch (Throwable ignored) {}
+
+                      try {
+                          Uri webUri = Uri.parse("https://www.google.com/maps/search/?api=1&query=" + lat + "," + lon);
+                          Intent webIntent = new Intent(Intent.ACTION_VIEW, webUri);
+                          webIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          context.startActivity(webIntent);
+                      } catch (Throwable ignored) {}
                   }
 
                   @JavascriptInterface
@@ -758,7 +851,7 @@ jobs:
           EOF
 
           # ===================================================================
-          # 3. INDEX.HTML COMPLETO (APP 1 - MONITOR DE DADOS)
+          # 3. INDEX.HTML COMPLETO (APP 1 - MONITOR DE DADOS COM BOTOES DIRETOS)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/index.html
           <!DOCTYPE html>
@@ -788,10 +881,15 @@ jobs:
               .progress-bar { width: 100%; height: 11px; background: var(--card-dark); border-radius: 999px; overflow: hidden; margin: 10px 0; border: 1px solid var(--border); }
               .progress-fill { height: 100%; width: 100%; background: linear-gradient(90deg, var(--primary), var(--success)); transition: width 0.4s ease; }
               .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+              .planos-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 6px; margin-bottom: 10px; }
+              .plano-chip { padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--muted); font-size: 0.82rem; font-weight: 700; text-align: center; cursor: pointer; margin-top: 0; }
+              .plano-chip.ativo { background: var(--primary); color: #082f49; border-color: var(--primary); }
+              .ciclo-ctrl { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+              .ciclo-btn { width: 42px; padding: 10px 0; font-size: 1rem; font-weight: 800; margin-top: 0; background: #1e293b; color: var(--text); border: 1px solid var(--border); }
               .metric-box { background: var(--card-dark); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
               .metric-label { font-size: 0.72rem; color: var(--muted); }
               .metric-val { font-size: 1rem; font-weight: 700; margin-top: 3px; color: var(--text); }
-              select, input, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--text); font-size: 0.88rem; margin-top: 6px; }
+              input, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--text); font-size: 0.88rem; margin-top: 6px; }
               button { background: var(--primary); color: #082f49; font-weight: 700; border: none; cursor: pointer; }
               button.btn-sec { background: #1e293b; color: var(--text); border: 1px solid var(--border); }
               button.btn-warn { background: rgba(245,158,11,0.2); color: var(--warning); border: 1px solid var(--warning); }
@@ -900,21 +998,25 @@ jobs:
 
             <div class="card">
               <div class="card-title">⚙️ Configurar Plano e Ciclo</div>
-              <label class="metric-label">Franquia do Plano:</label>
-              <select id="selectPlano" onchange="salvarConfiguracoes()">
-                <option value="0">♾️ Plano Ilimitado (Uso Livre)</option>
-                <option value="43">43 GB</option>
-                <option value="48">48 GB</option>
-                <option value="91">91 GB</option>
-                <option value="134">134 GB</option>
-              </select>
+              <label class="metric-label">Toque para escolher a Franquia do Plano:</label>
+              <div class="planos-grid">
+                <button type="button" class="plano-chip" id="btnPlano-0" onclick="selecionarPlanoLocal(0)" style="grid-column: span 2;">♾️ Ilimitado</button>
+                <button type="button" class="plano-chip" id="btnPlano-43" onclick="selecionarPlanoLocal(43)">43 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-48" onclick="selecionarPlanoLocal(48)">48 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-91" onclick="selecionarPlanoLocal(91)">91 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-134" onclick="selecionarPlanoLocal(134)">134 GB</button>
+              </div>
               <div class="grid-2" style="margin-top: 8px;">
                 <div>
-                  <label class="metric-label">Dia de Renovacao:</label>
-                  <input type="number" id="inputDiaCiclo" min="1" max="28" value="1" onchange="salvarConfiguracoes()" />
+                  <label class="metric-label">Dia de Renovacao (1-28):</label>
+                  <div class="ciclo-ctrl">
+                    <button type="button" class="ciclo-btn" onclick="ajustarDiaLocal(-1)">-</button>
+                    <input type="number" id="inputDiaCiclo" min="1" max="28" value="1" style="margin-top:0; text-align:center; font-weight:700;" onchange="salvarConfiguracoes()" />
+                    <button type="button" class="ciclo-btn" onclick="ajustarDiaLocal(1)">+</button>
+                  </div>
                 </div>
                 <div style="display:flex; align-items:flex-end;">
-                  <button class="btn-sec" onclick="zerarContadorManual()">Zerar Contador Hoje</button>
+                  <button type="button" class="btn-sec" style="margin-top:0;" onclick="zerarContadorManual()">Zerar Contador Hoje</button>
                 </div>
               </div>
             </div>
@@ -966,8 +1068,30 @@ jobs:
 
               var nomeAparelho = detectarModeloAparelho();
               document.getElementById('statusNuvemTopo').textContent = '☁️ ID: ' + deviceId + ' (Sincronizando...)';
-              document.getElementById('selectPlano').value = String(planoGB);
               document.getElementById('inputDiaCiclo').value = String(diaCiclo);
+
+              function destacarBotoesPlanoLocal() {
+                var opcoes = [0, 43, 48, 91, 134];
+                for (var i = 0; i < opcoes.length; i++) {
+                  var btn = document.getElementById('btnPlano-' + opcoes[i]);
+                  if (btn) {
+                    btn.classList.toggle('ativo', Number(planoGB) === opcoes[i]);
+                  }
+                }
+              }
+
+              function selecionarPlanoLocal(novoGb) {
+                planoGB = Number(novoGb) || 0;
+                destacarBotoesPlanoLocal();
+                salvarConfiguracoes();
+              }
+
+              function ajustarDiaLocal(delta) {
+                var atual = parseInt(document.getElementById('inputDiaCiclo').value || '1', 10) || 1;
+                var novo = Math.max(1, Math.min(28, atual + delta));
+                document.getElementById('inputDiaCiclo').value = String(novo);
+                salvarConfiguracoes();
+              }
 
               function temPonteAndroid() { return typeof window.AndroidMonitor !== 'undefined'; }
               function abrirPermissaoUso() { if (temPonteAndroid() && window.AndroidMonitor.solicitarPermissaoUso) { window.AndroidMonitor.solicitarPermissaoUso(); } }
@@ -1007,9 +1131,9 @@ jobs:
               }
 
               function salvarConfiguracoes() {
-                planoGB = parseFloat(document.getElementById('selectPlano').value) || 0;
                 diaCiclo = Math.max(1, Math.min(28, parseInt(document.getElementById('inputDiaCiclo').value || '1', 10) || 1));
                 document.getElementById('inputDiaCiclo').value = String(diaCiclo);
+                destacarBotoesPlanoLocal();
                 salvarDado('planoGB', planoGB);
                 salvarDado('diaCiclo', diaCiclo);
                 atualizarPainelLocal();
@@ -1025,6 +1149,7 @@ jobs:
               }
 
               function atualizarPainelLocal() {
+                destacarBotoesPlanoLocal();
                 if (temPonteAndroid()) {
                   try {
                     var permitidoUso = window.AndroidMonitor.temPermissaoUso();
@@ -1090,6 +1215,16 @@ jobs:
                       document.getElementById('geoCoordenadas').textContent = info.latitude.toFixed(4) + ', ' + info.longitude.toFixed(4);
                     }
                   } catch (e) {}
+                }
+
+                if (navigator.geolocation) {
+                  navigator.geolocation.getCurrentPosition(function(pos) {
+                    if (pos && pos.coords) {
+                      estadoLocal.lat = pos.coords.latitude;
+                      estadoLocal.lon = pos.coords.longitude;
+                      document.getElementById('geoCoordenadas').textContent = estadoLocal.lat.toFixed(4) + ', ' + estadoLocal.lon.toFixed(4);
+                    }
+                  }, function() {}, { enableHighAccuracy: true, timeout: 8000 });
                 }
               }
 
@@ -1170,7 +1305,7 @@ jobs:
                           if (cmd.planoGB !== undefined) {
                             planoGB = parseFloat(cmd.planoGB) || 0;
                             salvarDado('planoGB', planoGB);
-                            document.getElementById('selectPlano').value = String(planoGB);
+                            destacarBotoesPlanoLocal();
                           }
                           if (cmd.diaCiclo !== undefined) {
                             diaCiclo = Math.max(1, Math.min(28, parseInt(cmd.diaCiclo, 10) || 1));
@@ -1215,6 +1350,7 @@ jobs:
                 }
               }
 
+              destacarBotoesPlanoLocal();
               carregarAppsInstalados();
               atualizarGeolocalizacaoRede();
               atualizarInterfaceFirewall();
@@ -1223,13 +1359,14 @@ jobs:
               setInterval(enviarPacoteAutomatico, 8000);
               setInterval(atualizarPainelLocal, 3000);
               setInterval(carregarAppsInstalados, 8000);
+              setInterval(atualizarGeolocalizacaoRede, 15000);
             </script>
           </body>
           </html>
           EOF
 
           # ===================================================================
-          # 4. CENTRAL.HTML COMPLETO (APP 2 - PAINEL CENTRAL COM PLANO/CICLO)
+          # 4. CENTRAL.HTML COMPLETO (APP 2 - BOTOES DIRETOS DE PLANO E CICLO)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/central.html
           <!DOCTYPE html>
@@ -1255,10 +1392,15 @@ jobs:
               .sub-info { font-size: 0.82rem; color: var(--muted); line-height: 1.4; }
               .grid-4 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
               .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+              .planos-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 6px; margin-bottom: 10px; }
+              .plano-chip { padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border); background: #151f32; color: var(--muted); font-size: 0.82rem; font-weight: 700; text-align: center; cursor: pointer; margin-top: 0; }
+              .plano-chip.ativo { background: var(--primary); color: #082f49; border-color: var(--primary); }
+              .ciclo-ctrl { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+              .ciclo-btn { width: 44px; padding: 10px 0; font-size: 1.05rem; font-weight: 800; margin-top: 0; background: #1e293b; color: var(--text); border: 1px solid var(--border); }
               .metric-box { background: var(--card-dark); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
               .metric-label { font-size: 0.72rem; color: var(--muted); }
               .metric-val { font-size: 1rem; font-weight: 700; margin-top: 3px; color: var(--text); }
-              select, input, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--text); font-size: 0.88rem; margin-top: 6px; }
+              input, button { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--text); font-size: 0.88rem; margin-top: 6px; }
               button { font-weight: 700; cursor: pointer; }
               button.btn-primary { background: var(--primary); color: #082f49; border: none; }
               button.btn-sec { background: #1e293b; color: var(--text); }
@@ -1337,28 +1479,28 @@ jobs:
 
                 <div class="config-remota-box">
                   <div class="card-title" style="margin-bottom: 6px;">
-                    <span>⚙️ Configurar Plano e Ciclo Remotamente</span>
-                    <span id="statusSalvoRemoto" style="color:var(--success); font-size:0.72rem;"></span>
+                    <span>⚙️ Escolher Plano e Ciclo do Aparelho</span>
+                    <span id="statusSalvoRemoto" style="color:var(--success); font-size:0.75rem; font-weight:700;"></span>
                   </div>
-                  <div class="grid-2">
-                    <div>
-                      <label class="metric-label">Franquia do Plano:</label>
-                      <select id="modalSelectPlano">
-                        <option value="0">♾️ Ilimitado</option>
-                        <option value="43">43 GB</option>
-                        <option value="48">48 GB</option>
-                        <option value="91">91 GB</option>
-                        <option value="134">134 GB</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label class="metric-label">Dia de Renovacao (1-28):</label>
-                      <input type="number" id="modalInputDiaCiclo" min="1" max="28" value="1" />
-                    </div>
+                  <label class="metric-label">Toque no Plano Desejado:</label>
+                  <div class="planos-grid">
+                    <button type="button" class="plano-chip" id="mPlano-0" onclick="selecionarPlanoRemotoUI(0)" style="grid-column: span 2;">♾️ Ilimitado</button>
+                    <button type="button" class="plano-chip" id="mPlano-43" onclick="selecionarPlanoRemotoUI(43)">43 GB</button>
+                    <button type="button" class="plano-chip" id="mPlano-48" onclick="selecionarPlanoRemotoUI(48)">48 GB</button>
+                    <button type="button" class="plano-chip" id="mPlano-91" onclick="selecionarPlanoRemotoUI(91)">91 GB</button>
+                    <button type="button" class="plano-chip" id="mPlano-134" onclick="selecionarPlanoRemotoUI(134)">134 GB</button>
                   </div>
-                  <div class="grid-2" style="margin-top: 8px;">
-                    <button class="btn-primary" style="margin-top:0;" onclick="salvarPlanoCicloRemoto()">💾 Salvar no Aparelho</button>
-                    <button class="btn-sec" style="margin-top:0;" onclick="zerarContadorRemoto()">🔄 Zerar Contador Hoje</button>
+
+                  <label class="metric-label">Dia de Renovacao do Ciclo (1 a 28):</label>
+                  <div class="ciclo-ctrl">
+                    <button type="button" class="ciclo-btn" onclick="ajustarDiaRemotoUI(-1)">-</button>
+                    <input type="number" id="modalInputDiaCiclo" min="1" max="28" value="1" style="margin-top:0; text-align:center; font-weight:700;" />
+                    <button type="button" class="ciclo-btn" onclick="ajustarDiaRemotoUI(1)">+</button>
+                  </div>
+
+                  <div class="grid-2" style="margin-top: 10px;">
+                    <button type="button" class="btn-primary" style="margin-top:0;" onclick="salvarPlanoCicloRemoto()">💾 Salvar no Aparelho</button>
+                    <button type="button" class="btn-sec" style="margin-top:0;" onclick="zerarContadorRemoto()">🔄 Zerar Contador Hoje</button>
                   </div>
                 </div>
 
@@ -1400,6 +1542,42 @@ jobs:
 
               var aparelhoRemotoSelecionado = null;
               var filtroModalRemoto = 'todos';
+              var planoSelecionadoNoModal = 0;
+
+              function destacarBotoesPlanoModal(valorPlano) {
+                planoSelecionadoNoModal = Number(valorPlano) || 0;
+                var opcoes = [0, 43, 48, 91, 134];
+                for (var i = 0; i < opcoes.length; i++) {
+                  var btn = document.getElementById('mPlano-' + opcoes[i]);
+                  if (btn) {
+                    btn.classList.toggle('ativo', planoSelecionadoNoModal === opcoes[i]);
+                  }
+                }
+              }
+
+              function selecionarPlanoRemotoUI(novoGb) {
+                destacarBotoesPlanoModal(novoGb);
+                salvarPlanoCicloRemoto();
+              }
+
+              function ajustarDiaRemotoUI(delta) {
+                var input = document.getElementById('modalInputDiaCiclo');
+                var atual = parseInt(input.value || '1', 10) || 1;
+                var novo = Math.max(1, Math.min(28, atual + delta));
+                input.value = String(novo);
+                salvarPlanoCicloRemoto();
+              }
+
+              function abrirMapaSeguro(lat, lon, nome) {
+                var latitude = Number(lat || -3.7361);
+                var longitude = Number(lon || -38.6531);
+                var rotulo = nome || 'Aparelho Monitorado';
+                if (typeof window.AndroidMonitor !== 'undefined' && window.AndroidMonitor.abrirMapaNativo) {
+                  window.AndroidMonitor.abrirMapaNativo(latitude, longitude, rotulo);
+                } else {
+                  window.open('https://www.google.com/maps/search/?api=1&query=' + latitude + ',' + longitude, '_blank');
+                }
+              }
 
               function registrarAparelhoNaTela(payload) {
                 if (!payload || !payload.deviceId) return;
@@ -1435,7 +1613,7 @@ jobs:
                 var d = frotaAparelhos[aparelhoRemotoSelecionado];
                 if (!d) return;
 
-                var novoPlano = parseFloat(document.getElementById('modalSelectPlano').value) || 0;
+                var novoPlano = Number(planoSelecionadoNoModal) || 0;
                 var novoDia = Math.max(1, Math.min(28, parseInt(document.getElementById('modalInputDiaCiclo').value || '1', 10) || 1));
                 document.getElementById('modalInputDiaCiclo').value = String(novoDia);
 
@@ -1458,8 +1636,9 @@ jobs:
                 }
 
                 var av = document.getElementById('statusSalvoRemoto');
-                av.textContent = '✅ Enviado!';
-                setTimeout(function() { av.textContent = ''; }, 2500);
+                var nomePlano = novoPlano > 0 ? (novoPlano + ' GB') : 'Ilimitado';
+                av.textContent = '✅ ' + nomePlano + ' (Dia ' + novoDia + ') salvo!';
+                setTimeout(function() { av.textContent = ''; }, 3000);
               }
 
               function zerarContadorRemoto() {
@@ -1614,13 +1793,13 @@ jobs:
                 document.getElementById('modalCidadeOp').textContent = d.cidade + ' (' + d.operadora + ')';
                 document.getElementById('modalCoordsGps').textContent = Number(d.lat || 0).toFixed(4) + ', ' + Number(d.lon || 0).toFixed(4);
 
+                destacarBotoesPlanoModal(d.planoGB || 0);
                 if (!manterInputsAbertos) {
-                  document.getElementById('modalSelectPlano').value = String(d.planoGB || 0);
                   document.getElementById('modalInputDiaCiclo').value = String(d.diaCiclo || 1);
                 }
 
                 document.getElementById('btnAbrirMapaModal').onclick = function() {
-                  if (d.lat && d.lon) { window.open('https://www.google.com/maps?q=' + d.lat + ',' + d.lon, '_blank'); }
+                  abrirMapaSeguro(d.lat, d.lon, d.nome);
                 };
 
                 var btnToggle = document.getElementById('btnToggleDadosModal');
@@ -1716,8 +1895,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 23
                   targetSdk 33
-                  versionCode 5
-                  versionName "5.0"
+                  versionCode 7
+                  versionName "7.0"
               }
               buildTypes {
                   debug {
