@@ -40,11 +40,17 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-      - name: 4. Gerar todos os arquivos completos do projeto (Manifest + Java + HTMLs)
+      - name: 4. Gerar todos os arquivos completos do projeto (Manifest + Java + MQTT Local + HTMLs)
         run: |
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/example/monitordados
           mkdir -p APKs-Prontos
+
+          # Baixa a biblioteca MQTT direto para dentro do APK (evita falha de internet ao abrir)
+          curl -sL https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js -o app/src/main/assets/mqtt.min.js || true
+          if [ ! -s app/src/main/assets/mqtt.min.js ]; then
+            curl -sL https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js -o app/src/main/assets/mqtt.min.js || true
+          fi
 
           # ===================================================================
           # 1. ANDROIDMANIFEST.XML COMPLETO
@@ -58,9 +64,11 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
               <uses-permission android:name="android.permission.READ_PHONE_STATE" />
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -119,13 +127,14 @@ jobs:
           sed -i 's/^          //' app/src/main/AndroidManifest.xml
 
           # ===================================================================
-          # 2. MAINACTIVITY.JAVA COMPLETO (COM MUTABLECONTEXTWRAPPER + MAPS + VPN)
+          # 2. MAINACTIVITY.JAVA COMPLETO (PULSO NATIVO 24H + WIFILOCK + MAPS + VPN)
           # ===================================================================
           cat << 'EOF' > app/src/main/java/com/example/monitordados/MainActivity.java
           package com.example.monitordados;
 
           import android.Manifest;
           import android.app.Activity;
+          import android.app.AlarmManager;
           import android.app.AppOpsManager;
           import android.app.Notification;
           import android.app.NotificationChannel;
@@ -149,6 +158,7 @@ jobs:
           import android.net.TrafficStats;
           import android.net.Uri;
           import android.net.VpnService;
+          import android.net.wifi.WifiManager;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
@@ -157,6 +167,7 @@ jobs:
           import android.os.ParcelFileDescriptor;
           import android.os.PowerManager;
           import android.os.Process;
+          import android.os.SystemClock;
           import android.provider.Settings;
           import android.telephony.TelephonyManager;
           import android.view.View;
@@ -225,8 +236,8 @@ jobs:
                                       browserIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                                       ctx.startActivity(browserIntent);
                                       return true;
+                                  }
                               }
-                          }
                           }
                           return true;
                       }
@@ -266,6 +277,10 @@ jobs:
                       settings.setDomStorageEnabled(true);
                       settings.setGeolocationEnabled(true);
                       settings.setAllowFileAccess(true);
+                      settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                          settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                      }
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
                           settings.setMediaPlaybackRequiresUserGesture(false);
                       }
@@ -298,6 +313,26 @@ jobs:
 
                   webViewGlobal.onResume();
                   webViewGlobal.resumeTimers();
+              }
+
+              public static void acionarPulsoWebView(final Context context) {
+                  new Handler(Looper.getMainLooper()).post(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              garantirMotorWebAtivo(context);
+                              if (webViewGlobal != null) {
+                                  webViewGlobal.onResume();
+                                  webViewGlobal.resumeTimers();
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                                      webViewGlobal.evaluateJavascript("try { if (typeof window.pulsoNativoSegundoPlano === 'function') { window.pulsoNativoSegundoPlano(); } } catch(e) {}", null);
+                                  } else {
+                                      webViewGlobal.loadUrl("javascript:try{if(typeof window.pulsoNativoSegundoPlano==='function'){window.pulsoNativoSegundoPlano();}}catch(e){}");
+                                  }
+                              }
+                          } catch (Throwable ignored) {}
+                      }
+                  });
               }
 
               public static void iniciarServico24h(Context context) {
@@ -344,6 +379,7 @@ jobs:
                       webViewGlobal.onResume();
                       webViewGlobal.resumeTimers();
                   }
+                  acionarPulsoWebView(this);
               }
 
               @Override
@@ -438,28 +474,70 @@ jobs:
                   @Override
                   public void onReceive(Context context, Intent intent) {
                       iniciarServico24h(context);
-                      garantirMotorWebAtivo(context);
+                      acionarPulsoWebView(context);
                   }
               }
 
               public static class MonitorSempreAtivoService extends Service {
                   private static final String CANAL_ID = "monitor_dados_24h";
                   private PowerManager.WakeLock wakeLock;
+                  private WifiManager.WifiLock wifiLock;
+                  private Handler handlerPulso;
+                  private Runnable runnablePulso;
 
                   @Override
                   public void onCreate() {
                       super.onCreate();
                       iniciarNotificacaoDiscreta();
-                      ativarWakeLock();
+                      ativarLocks24h();
                       garantirMotorWebAtivo(getApplicationContext());
+                      iniciarLoopNativoSegundoPlano();
                   }
 
                   @Override
                   public int onStartCommand(Intent intent, int flags, int startId) {
                       iniciarNotificacaoDiscreta();
-                      ativarWakeLock();
+                      ativarLocks24h();
                       garantirMotorWebAtivo(getApplicationContext());
+                      iniciarLoopNativoSegundoPlano();
+                      agendarReativacaoAlarme();
                       return START_STICKY;
+                  }
+
+                  private void iniciarLoopNativoSegundoPlano() {
+                      if (handlerPulso == null) {
+                          handlerPulso = new Handler(Looper.getMainLooper());
+                      }
+                      if (runnablePulso == null) {
+                          runnablePulso = new Runnable() {
+                              @Override
+                              public void run() {
+                                  try {
+                                      ativarLocks24h();
+                                      acionarPulsoWebView(getApplicationContext());
+                                  } catch (Throwable ignored) {}
+                                  if (handlerPulso != null) {
+                                      handlerPulso.postDelayed(this, 6000);
+                                  }
+                              }
+                          };
+                          handlerPulso.postDelayed(runnablePulso, 4000);
+                      }
+                  }
+
+                  private void agendarReativacaoAlarme() {
+                      try {
+                          AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+                          if (am != null) {
+                              Intent i = new Intent(getApplicationContext(), BootReceiver.class);
+                              int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                  flags |= PendingIntent.FLAG_IMMUTABLE;
+                              }
+                              PendingIntent pi = PendingIntent.getBroadcast(getApplicationContext(), 909, i, flags);
+                              am.setRepeating(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 60000, 60000, pi);
+                          }
+                      } catch (Throwable ignored) {}
                   }
 
                   private void iniciarNotificacaoDiscreta() {
@@ -491,28 +569,44 @@ jobs:
                       } catch (Throwable ignored) {}
                   }
 
-                  private void ativarWakeLock() {
+                  private void ativarLocks24h() {
                       try {
                           PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                          if (pm != null && wakeLock == null) {
-                              wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MonitorDados::SempreAtivoLock");
-                              wakeLock.setReferenceCounted(false);
-                              wakeLock.acquire();
+                          if (pm != null) {
+                              if (wakeLock == null) {
+                                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MonitorDados::SempreAtivoLock");
+                                  wakeLock.setReferenceCounted(false);
+                              }
+                              if (!wakeLock.isHeld()) {
+                                  wakeLock.acquire();
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+
+                      try {
+                          WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                          if (wm != null) {
+                              if (wifiLock == null) {
+                                  wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "MonitorDados::WifiSempreAtivo");
+                                  wifiLock.setReferenceCounted(false);
+                              }
+                              if (!wifiLock.isHeld()) {
+                                  wifiLock.acquire();
+                              }
                           }
                       } catch (Throwable ignored) {}
                   }
 
                   @Override
                   public void onTaskRemoved(Intent rootIntent) {
+                      agendarReativacaoAlarme();
                       iniciarServico24h(getApplicationContext());
                       super.onTaskRemoved(rootIntent);
                   }
 
                   @Override
                   public void onDestroy() {
-                      if (wakeLock != null && wakeLock.isHeld()) {
-                          try { wakeLock.release(); } catch (Throwable ignored) {}
-                      }
+                      agendarReativacaoAlarme();
                       iniciarServico24h(getApplicationContext());
                       super.onDestroy();
                   }
@@ -851,7 +945,7 @@ jobs:
           EOF
 
           # ===================================================================
-          # 3. INDEX.HTML COMPLETO (APP 1 - MONITOR DE DADOS COM BOTOES DIRETOS)
+          # 3. INDEX.HTML COMPLETO (APP 1 - MONITOR: GEO OCULTA, PLANO TRAVADO E MULTI-MQTT)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/index.html
           <!DOCTYPE html>
@@ -860,7 +954,12 @@ jobs:
             <meta charset="UTF-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
             <title>Monitor de Dados Moveis</title>
-            <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+            <script src="mqtt.min.js"></script>
+            <script>
+              if (typeof mqtt === 'undefined') {
+                document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js"><\/script>');
+              }
+            </script>
             <style>
               :root {
                 --bg: #0b1120; --card: #151f32; --card-dark: #0f172a; --border: #263554;
@@ -882,10 +981,8 @@ jobs:
               .progress-fill { height: 100%; width: 100%; background: linear-gradient(90deg, var(--primary), var(--success)); transition: width 0.4s ease; }
               .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
               .planos-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 6px; margin-bottom: 10px; }
-              .plano-chip { padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--muted); font-size: 0.82rem; font-weight: 700; text-align: center; cursor: pointer; margin-top: 0; }
-              .plano-chip.ativo { background: var(--primary); color: #082f49; border-color: var(--primary); }
-              .ciclo-ctrl { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
-              .ciclo-btn { width: 42px; padding: 10px 0; font-size: 1rem; font-weight: 800; margin-top: 0; background: #1e293b; color: var(--text); border: 1px solid var(--border); }
+              .plano-chip { padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--card-dark); color: var(--muted); font-size: 0.82rem; font-weight: 700; text-align: center; margin-top: 0; opacity: 0.55; pointer-events: none; user-select: none; }
+              .plano-chip.ativo { background: rgba(56,189,248,0.22); color: var(--primary); border-color: var(--primary); opacity: 1; }
               .metric-box { background: var(--card-dark); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
               .metric-label { font-size: 0.72rem; color: var(--muted); }
               .metric-val { font-size: 1rem; font-weight: 700; margin-top: 3px; color: var(--text); }
@@ -907,8 +1004,7 @@ jobs:
               .tag-net-on { background: rgba(34,197,94,0.2); color: #4ade80; }
               .tag-net-idle { background: rgba(56,189,248,0.15); color: #38bdf8; }
               .tag-net-block { background: rgba(239,68,68,0.25); color: #f87171; border: 1px solid var(--danger); }
-              .tag-geo-on { background: rgba(245,158,11,0.2); color: #fbbf24; }
-              .tag-geo-off { background: rgba(148,163,184,0.15); color: #94a3b8; }
+              .tag-lock { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.4); font-size: 0.7rem; padding: 3px 8px; border-radius: 999px; font-weight: 700; }
               .app-consumo { text-align: right; font-weight: 800; font-size: 0.92rem; color: var(--primary); white-space: nowrap; }
               .alerta-box { display: none; padding: 10px; border-radius: 10px; margin-bottom: 12px; font-size: 0.85rem; font-weight: 600; }
               .banner-firewall { display: none; background: rgba(239, 68, 68, 0.18); border: 1px solid var(--danger); color: #f87171; padding: 12px; border-radius: 12px; margin-bottom: 12px; font-size: 0.84rem; line-height: 1.4; }
@@ -930,7 +1026,7 @@ jobs:
 
             <div id="boxPermissao" class="card" style="display:none; border-color: var(--warning);">
               <div class="card-title" style="color: var(--warning);">⚠️ Permissoes do Sistema</div>
-              <p class="sub-info" style="margin-bottom: 8px;">Ative o Acesso ao Uso e a Chave de Firewall para controle remoto completo.</p>
+              <p class="sub-info" style="margin-bottom: 8px;">Ative o Acesso ao Uso e a Chave de Firewall para sincronizacao completa.</p>
               <button id="btnPermUso" class="btn-warn" onclick="abrirPermissaoUso()">1. Liberar Acesso ao Uso no Android</button>
               <button id="btnPermVpn" class="btn-sec" onclick="abrirPermissaoVpn()" style="margin-top:6px;">2. Autorizar Chave de Firewall (VPN)</button>
             </div>
@@ -957,39 +1053,21 @@ jobs:
               </div>
             </div>
 
-            <div class="card">
-              <div class="card-title">
-                <span>📍 Rede Ativa e Geolocalizacao</span>
-                <button class="filtro-btn" onclick="atualizarGeolocalizacaoRede()">Atualizar GPS/IP</button>
-              </div>
-              <div class="grid-2">
-                <div class="metric-box">
-                  <div class="metric-label">Rede em Funcionamento</div>
-                  <div class="metric-val" id="geoRedeAtiva" style="font-size:0.9rem;">Detectando...</div>
-                </div>
-                <div class="metric-box">
-                  <div class="metric-label">Localizacao / Cidade</div>
-                  <div class="metric-val" id="geoCidade" style="font-size:0.9rem;">Caucaia - CE</div>
-                </div>
-                <div class="metric-box">
-                  <div class="metric-label">Coordenadas GPS</div>
-                  <div class="metric-val" id="geoCoordenadas" style="font-size:0.82rem;">Aguardando GPS...</div>
-                </div>
-                <div class="metric-box">
-                  <div class="metric-label">Operadora / Provedor</div>
-                  <div class="metric-val" id="geoOperadora" style="font-size:0.82rem;">--</div>
-                </div>
-              </div>
+            <!-- Geolocalizacao oculta visualmente no Monitor -->
+            <div style="display:none;" aria-hidden="true">
+              <span id="geoRedeAtiva"></span>
+              <span id="geoCidade"></span>
+              <span id="geoCoordenadas"></span>
+              <span id="geoOperadora"></span>
             </div>
 
             <div class="card">
               <div class="card-title">
-                <span>📱 Apps Instalados (Rede e GPS)</span>
+                <span>📱 Consumo por Aplicativo</span>
                 <span id="contadorApps">0 apps</span>
               </div>
               <div class="filtros-apps">
                 <button class="filtro-btn ativo" id="f-todos" onclick="definirFiltroApps('todos')">Todos</button>
-                <button class="filtro-btn" id="f-geo" onclick="definirFiltroApps('geo')">📍 Com GPS</button>
                 <button class="filtro-btn" id="f-rede" onclick="definirFiltroApps('rede')">🟢 Em Trafego</button>
                 <button class="filtro-btn" id="f-bloq" onclick="definirFiltroApps('bloq')">🚫 Bloqueados</button>
               </div>
@@ -997,26 +1075,26 @@ jobs:
             </div>
 
             <div class="card">
-              <div class="card-title">⚙️ Configurar Plano e Ciclo</div>
-              <label class="metric-label">Toque para escolher a Franquia do Plano:</label>
+              <div class="card-title">
+                <span>⚙️ Plano e Ciclo de Dados</span>
+                <span class="tag-lock">🔒 Travado pela Central</span>
+              </div>
+              <label class="metric-label">Franquia configurada pelo administrador:</label>
               <div class="planos-grid">
-                <button type="button" class="plano-chip" id="btnPlano-0" onclick="selecionarPlanoLocal(0)" style="grid-column: span 2;">♾️ Ilimitado</button>
-                <button type="button" class="plano-chip" id="btnPlano-43" onclick="selecionarPlanoLocal(43)">43 GB</button>
-                <button type="button" class="plano-chip" id="btnPlano-48" onclick="selecionarPlanoLocal(48)">48 GB</button>
-                <button type="button" class="plano-chip" id="btnPlano-91" onclick="selecionarPlanoLocal(91)">91 GB</button>
-                <button type="button" class="plano-chip" id="btnPlano-134" onclick="selecionarPlanoLocal(134)">134 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-0" disabled style="grid-column: span 2;">♾️ Ilimitado</button>
+                <button type="button" class="plano-chip" id="btnPlano-43" disabled>43 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-48" disabled>48 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-91" disabled>91 GB</button>
+                <button type="button" class="plano-chip" id="btnPlano-134" disabled>134 GB</button>
               </div>
               <div class="grid-2" style="margin-top: 8px;">
-                <div>
-                  <label class="metric-label">Dia de Renovacao (1-28):</label>
-                  <div class="ciclo-ctrl">
-                    <button type="button" class="ciclo-btn" onclick="ajustarDiaLocal(-1)">-</button>
-                    <input type="number" id="inputDiaCiclo" min="1" max="28" value="1" style="margin-top:0; text-align:center; font-weight:700;" onchange="salvarConfiguracoes()" />
-                    <button type="button" class="ciclo-btn" onclick="ajustarDiaLocal(1)">+</button>
-                  </div>
+                <div class="metric-box">
+                  <div class="metric-label">Renovacao do Ciclo</div>
+                  <div class="metric-val" id="txtDiaCicloTravado">Todo dia 1</div>
                 </div>
-                <div style="display:flex; align-items:flex-end;">
-                  <button type="button" class="btn-sec" style="margin-top:0;" onclick="zerarContadorManual()">Zerar Contador Hoje</button>
+                <div class="metric-box">
+                  <div class="metric-label">Modo de Controle</div>
+                  <div class="metric-val" style="font-size:0.85rem; color:var(--warning);">🔒 Somente Leitura</div>
                 </div>
               </div>
             </div>
@@ -1034,7 +1112,13 @@ jobs:
 
               var PREFIXO_MQTT = 'frota_josimar_2026_v6/aparelhos/';
               var PREFIXO_CMD = 'frota_josimar_2026_v6/comandos/';
-              var clientMqtt = null;
+              var ROTAS_MQTT = [
+                'wss://broker.emqx.io:8084/mqtt',
+                'ws://broker.emqx.io:8083/mqtt',
+                'wss://broker.hivemq.com:8884/mqtt'
+              ];
+              var clientesMqtt = [];
+              var ultimoCmdTimestamp = 0;
 
               var planoGB = parseFloat(lerDado('planoGB', '0')) || 0;
               var diaCiclo = parseInt(lerDado('diaCiclo', '1'), 10) || 1;
@@ -1067,8 +1151,7 @@ jobs:
               }
 
               var nomeAparelho = detectarModeloAparelho();
-              document.getElementById('statusNuvemTopo').textContent = '☁️ ID: ' + deviceId + ' (Sincronizando...)';
-              document.getElementById('inputDiaCiclo').value = String(diaCiclo);
+              document.getElementById('statusNuvemTopo').textContent = '☁️ ' + nomeAparelho;
 
               function destacarBotoesPlanoLocal() {
                 var opcoes = [0, 43, 48, 91, 134];
@@ -1078,19 +1161,8 @@ jobs:
                     btn.classList.toggle('ativo', Number(planoGB) === opcoes[i]);
                   }
                 }
-              }
-
-              function selecionarPlanoLocal(novoGb) {
-                planoGB = Number(novoGb) || 0;
-                destacarBotoesPlanoLocal();
-                salvarConfiguracoes();
-              }
-
-              function ajustarDiaLocal(delta) {
-                var atual = parseInt(document.getElementById('inputDiaCiclo').value || '1', 10) || 1;
-                var novo = Math.max(1, Math.min(28, atual + delta));
-                document.getElementById('inputDiaCiclo').value = String(novo);
-                salvarConfiguracoes();
+                var elDia = document.getElementById('txtDiaCicloTravado');
+                if (elDia) { elDia.textContent = 'Todo dia ' + diaCiclo; }
               }
 
               function temPonteAndroid() { return typeof window.AndroidMonitor !== 'undefined'; }
@@ -1130,17 +1202,6 @@ jobs:
                 enviarPacoteAutomatico();
               }
 
-              function salvarConfiguracoes() {
-                diaCiclo = Math.max(1, Math.min(28, parseInt(document.getElementById('inputDiaCiclo').value || '1', 10) || 1));
-                document.getElementById('inputDiaCiclo').value = String(diaCiclo);
-                destacarBotoesPlanoLocal();
-                salvarDado('planoGB', planoGB);
-                salvarDado('diaCiclo', diaCiclo);
-                atualizarPainelLocal();
-                carregarAppsInstalados();
-                enviarPacoteAutomatico();
-              }
-
               function zerarContadorManual() {
                 offsetZeroGB = ultimoConsumoBrutoGB;
                 salvarDado('offsetZeroGB', offsetZeroGB);
@@ -1171,11 +1232,9 @@ jobs:
                 }
 
                 var consumoLiquido = Math.max(0, ultimoConsumoBrutoGB - offsetZeroGB);
-                var redeMostrada = firewallGeralAtivo ? '🛡️ Firewall Ativo (Apps Bloqueados)' : estadoLocal.rede;
                 var velMostrada = firewallGeralAtivo ? 0 : Number(estadoLocal.velocidade);
 
                 if (!firewallGeralAtivo) { document.getElementById('badgeRedeTopo').textContent = '🟢 ' + estadoLocal.rede; }
-                document.getElementById('geoRedeAtiva').textContent = redeMostrada;
                 document.getElementById('valorConsumoGB').textContent = consumoLiquido.toFixed(2) + ' GB';
                 document.getElementById('valVelocidade').textContent = velMostrada.toFixed(2) + ' Mbps';
                 document.getElementById('valLatencia').textContent = firewallGeralAtivo ? 'Bloqueado' : ((estadoLocal.latencia > 0 ? estadoLocal.latencia : 22) + ' ms');
@@ -1202,17 +1261,13 @@ jobs:
               }
 
               function atualizarGeolocalizacaoRede() {
-                document.getElementById('geoCidade').textContent = estadoLocal.cidade;
-                document.getElementById('geoOperadora').textContent = estadoLocal.operadora;
-                document.getElementById('geoCoordenadas').textContent = estadoLocal.lat.toFixed(4) + ', ' + estadoLocal.lon.toFixed(4);
-
                 if (temPonteAndroid() && window.AndroidMonitor.obterInfoRedeEGeoJSON) {
                   try {
                     var info = JSON.parse(window.AndroidMonitor.obterInfoRedeEGeoJSON());
-                    if (info.operadora) { estadoLocal.operadora = info.operadora; document.getElementById('geoOperadora').textContent = info.operadora; }
+                    if (info.operadora) { estadoLocal.operadora = info.operadora; }
                     if (info.latitude && info.longitude && (info.latitude !== 0 || info.longitude !== 0)) {
-                      estadoLocal.lat = info.latitude; estadoLocal.lon = info.longitude;
-                      document.getElementById('geoCoordenadas').textContent = info.latitude.toFixed(4) + ', ' + info.longitude.toFixed(4);
+                      estadoLocal.lat = info.latitude;
+                      estadoLocal.lon = info.longitude;
                     }
                   } catch (e) {}
                 }
@@ -1222,7 +1277,6 @@ jobs:
                     if (pos && pos.coords) {
                       estadoLocal.lat = pos.coords.latitude;
                       estadoLocal.lon = pos.coords.longitude;
-                      document.getElementById('geoCoordenadas').textContent = estadoLocal.lat.toFixed(4) + ', ' + estadoLocal.lon.toFixed(4);
                     }
                   }, function() {}, { enableHighAccuracy: true, timeout: 8000 });
                 }
@@ -1247,7 +1301,6 @@ jobs:
               function definirFiltroApps(filtro) {
                 filtroAtualApps = filtro;
                 document.getElementById('f-todos').classList.toggle('ativo', filtro === 'todos');
-                document.getElementById('f-geo').classList.toggle('ativo', filtro === 'geo');
                 document.getElementById('f-rede').classList.toggle('ativo', filtro === 'rede');
                 document.getElementById('f-bloq').classList.toggle('ativo', filtro === 'bloq');
                 renderizarListaApps(cacheApps, filtroAtualApps, 'listaAppsContainer', 'contadorApps');
@@ -1260,8 +1313,7 @@ jobs:
                   return { nome: a.nome, pacote: a.pacote, totalMB: a.totalMB, redeAtiva: bloq ? 'Internet Bloqueada' : a.redeAtiva, emTransmissao: bloq ? false : a.emTransmissao, usaGeo: a.usaGeo, geoAtiva: a.geoAtiva, bloqueado: bloq };
                 });
 
-                if (filtro === 'geo') { filtrados = filtrados.filter(function(a) { return a.usaGeo; }); }
-                else if (filtro === 'rede') { filtrados = filtrados.filter(function(a) { return !a.bloqueado && a.emTransmissao; }); }
+                if (filtro === 'rede') { filtrados = filtrados.filter(function(a) { return !a.bloqueado && a.emTransmissao; }); }
                 else if (filtro === 'bloq') { filtrados = filtrados.filter(function(a) { return a.bloqueado; }); }
 
                 document.getElementById(contadorId).textContent = filtrados.length + ' apps';
@@ -1269,63 +1321,94 @@ jobs:
 
                 container.innerHTML = filtrados.map(function(app) {
                   var badgeRede = app.bloqueado ? '<span class="tag tag-net-block">🚫 Bloqueado</span>' : (app.emTransmissao ? '<span class="tag tag-net-on">🟢 Ativo</span>' : '<span class="tag tag-net-idle">📶 Conectado</span>');
-                  var badgeGeo = app.usaGeo ? (app.geoAtiva ? '<span class="tag tag-geo-on">📍 GPS</span>' : '<span class="tag tag-geo-off">🔒 S/ GPS</span>') : '';
                   var mb = Number(app.totalMB || 0);
                   var valorFormatado = mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
                   return '<div class="app-item ' + (app.bloqueado ? 'app-bloqueado' : '') + '">' +
-                    '<div class="app-main"><div class="app-nome">' + app.nome + '</div><div class="app-pkg">' + app.pacote + '</div><div class="app-badges">' + badgeRede + ' ' + badgeGeo + '</div></div>' +
+                    '<div class="app-main"><div class="app-nome">' + app.nome + '</div><div class="app-pkg">' + app.pacote + '</div><div class="app-badges">' + badgeRede + '</div></div>' +
                     '<div class="app-consumo">' + valorFormatado + '</div></div>';
                 }).join('');
               }
 
+              function processarComandoRecebido(message) {
+                try {
+                  var cmd = JSON.parse(message.toString());
+                  if (!cmd) return;
+                  if (cmd.timestamp && cmd.timestamp === ultimoCmdTimestamp) return;
+                  if (cmd.timestamp) ultimoCmdTimestamp = cmd.timestamp;
+
+                  if (cmd.acao === 'PING_FROTA') {
+                    enviarPacoteAutomatico();
+                    return;
+                  }
+                  if (cmd.acao === 'FIREWALL_GERAL' || cmd.acao === 'DESLIGAR_DADOS' || cmd.acao === 'RELIGAR_DADOS') {
+                    firewallGeralAtivo = (cmd.acao === 'DESLIGAR_DADOS' || Boolean(cmd.bloquear));
+                    salvarDado('firewallGeral_v7', firewallGeralAtivo ? 'true' : 'false');
+                    atualizarInterfaceFirewall();
+                  }
+                  if (cmd.acao === 'FIREWALL_APP' && cmd.pacote) {
+                    if (cmd.bloquear) { appsBloqueadosMap[cmd.pacote] = true; } else { delete appsBloqueadosMap[cmd.pacote]; }
+                    salvarDado('appsBloqueados_v7', JSON.stringify(appsBloqueadosMap));
+                    atualizarInterfaceFirewall();
+                  }
+                  if (cmd.acao === 'CONFIG_PLANO') {
+                    if (cmd.planoGB !== undefined) {
+                      planoGB = parseFloat(cmd.planoGB) || 0;
+                      salvarDado('planoGB', planoGB);
+                    }
+                    if (cmd.diaCiclo !== undefined) {
+                      diaCiclo = Math.max(1, Math.min(28, parseInt(cmd.diaCiclo, 10) || 1));
+                      salvarDado('diaCiclo', diaCiclo);
+                    }
+                    if (cmd.zerarHoje) {
+                      offsetZeroGB = ultimoConsumoBrutoGB;
+                      salvarDado('offsetZeroGB', offsetZeroGB);
+                    }
+                    destacarBotoesPlanoLocal();
+                    atualizarPainelLocal();
+                    carregarAppsInstalados();
+                    enviarPacoteAutomatico();
+                  }
+                  if (cmd.acao === 'RENOMEAR_APARELHO' && cmd.novoNome) {
+                    nomeAparelho = String(cmd.novoNome).trim();
+                    salvarDado('nomeAparelho_v6', nomeAparelho);
+                    document.getElementById('statusNuvemTopo').textContent = '☁️ ' + nomeAparelho;
+                    enviarPacoteAutomatico();
+                  }
+                  if (cmd.acao === 'ZERAR_CONTADOR') {
+                    zerarContadorManual();
+                  }
+                } catch (e) {}
+              }
+
               function iniciarConexaoNuvem() {
                 try {
-                  if (typeof mqtt !== 'undefined') {
-                    clientMqtt = mqtt.connect('wss://broker.emqx.io:8084/mqtt', { clientId: 'mon_' + deviceId + '_' + Math.floor(Math.random() * 9999), clean: true, reconnectPeriod: 3000 });
-                    clientMqtt.on('connect', function() {
-                      document.getElementById('statusNuvemTopo').textContent = '☁️ Sincronizado • ID: ' + deviceId;
-                      clientMqtt.subscribe(PREFIXO_CMD + deviceId, { qos: 0 });
-                      enviarPacoteAutomatico();
-                    });
-                    clientMqtt.on('message', function(topic, message) {
-                      try {
-                        var cmd = JSON.parse(message.toString());
-                        if (!cmd) return;
-                        if (cmd.acao === 'FIREWALL_GERAL' || cmd.acao === 'DESLIGAR_DADOS' || cmd.acao === 'RELIGAR_DADOS') {
-                          firewallGeralAtivo = (cmd.acao === 'DESLIGAR_DADOS' || Boolean(cmd.bloquear));
-                          salvarDado('firewallGeral_v7', firewallGeralAtivo ? 'true' : 'false');
-                          atualizarInterfaceFirewall();
-                        }
-                        if (cmd.acao === 'FIREWALL_APP' && cmd.pacote) {
-                          if (cmd.bloquear) { appsBloqueadosMap[cmd.pacote] = true; } else { delete appsBloqueadosMap[cmd.pacote]; }
-                          salvarDado('appsBloqueados_v7', JSON.stringify(appsBloqueadosMap));
-                          atualizarInterfaceFirewall();
-                        }
-                        if (cmd.acao === 'CONFIG_PLANO') {
-                          if (cmd.planoGB !== undefined) {
-                            planoGB = parseFloat(cmd.planoGB) || 0;
-                            salvarDado('planoGB', planoGB);
-                            destacarBotoesPlanoLocal();
-                          }
-                          if (cmd.diaCiclo !== undefined) {
-                            diaCiclo = Math.max(1, Math.min(28, parseInt(cmd.diaCiclo, 10) || 1));
-                            salvarDado('diaCiclo', diaCiclo);
-                            document.getElementById('inputDiaCiclo').value = String(diaCiclo);
-                          }
-                          if (cmd.zerarHoje) {
-                            offsetZeroGB = ultimoConsumoBrutoGB;
-                            salvarDado('offsetZeroGB', offsetZeroGB);
-                          }
-                          atualizarPainelLocal();
-                          carregarAppsInstalados();
-                          enviarPacoteAutomatico();
-                        }
-                        if (cmd.acao === 'ZERAR_CONTADOR') {
-                          zerarContadorManual();
-                        }
-                      } catch (e) {}
-                    });
+                  if (typeof mqtt === 'undefined') return;
+                  for (var k = 0; k < clientesMqtt.length; k++) {
+                    try { clientesMqtt[k].end(true); } catch (e) {}
                   }
+                  clientesMqtt = [];
+
+                  ROTAS_MQTT.forEach(function(urlRota, idx) {
+                    try {
+                      var cli = mqtt.connect(urlRota, {
+                        clientId: 'mon_' + deviceId + '_' + idx + '_' + Math.floor(Math.random() * 99999),
+                        clean: true,
+                        keepalive: 25,
+                        reconnectPeriod: 2500,
+                        connectTimeout: 8000
+                      });
+                      cli.on('connect', function() {
+                        document.getElementById('statusNuvemTopo').textContent = '☁️ Online • ' + nomeAparelho;
+                        cli.subscribe(PREFIXO_CMD + deviceId, { qos: 0 });
+                        cli.subscribe(PREFIXO_CMD + 'TODOS', { qos: 0 });
+                        enviarPacoteAutomatico();
+                      });
+                      cli.on('message', function(topic, message) {
+                        processarComandoRecebido(message);
+                      });
+                      clientesMqtt.push(cli);
+                    } catch (e) {}
+                  });
                 } catch (e) {}
               }
 
@@ -1344,11 +1427,38 @@ jobs:
                   lat: Number(Number(estadoLocal.lat || -3.7361).toFixed(5)), lon: Number(Number(estadoLocal.lon || -38.6531).toFixed(5)), apps: appsCompactados
                 };
 
-                if (clientMqtt && clientMqtt.connected) {
-                  clientMqtt.publish(PREFIXO_MQTT + deviceId, JSON.stringify(pacote), { qos: 0, retain: true });
-                  document.getElementById('statusNuvemTopo').textContent = '☁️ Sincronizado • ID: ' + deviceId;
+                var jsonStr = JSON.stringify(pacote);
+                var algumConectado = false;
+                for (var i = 0; i < clientesMqtt.length; i++) {
+                  if (clientesMqtt[i] && clientesMqtt[i].connected) {
+                    algumConectado = true;
+                    try { clientesMqtt[i].publish(PREFIXO_MQTT + deviceId, jsonStr, { qos: 0, retain: true }); } catch (e) {}
+                  }
+                }
+                if (algumConectado) {
+                  document.getElementById('statusNuvemTopo').textContent = '☁️ Online • ' + nomeAparelho;
                 }
               }
+
+              window.pulsoNativoSegundoPlano = function() {
+                try {
+                  atualizarPainelLocal();
+                  atualizarGeolocalizacaoRede();
+                  var temAtivo = false;
+                  for (var i = 0; i < clientesMqtt.length; i++) {
+                    if (clientesMqtt[i] && clientesMqtt[i].connected) { temAtivo = true; break; }
+                  }
+                  if (!temAtivo) {
+                    if (clientesMqtt.length === 0) { iniciarConexaoNuvem(); }
+                    else {
+                      for (var j = 0; j < clientesMqtt.length; j++) {
+                        try { if (clientesMqtt[j].reconnect) clientesMqtt[j].reconnect(); } catch (e) {}
+                      }
+                    }
+                  }
+                  enviarPacoteAutomatico();
+                } catch (e) {}
+              };
 
               destacarBotoesPlanoLocal();
               carregarAppsInstalados();
@@ -1356,9 +1466,9 @@ jobs:
               atualizarInterfaceFirewall();
               iniciarConexaoNuvem();
               setTimeout(enviarPacoteAutomatico, 1000);
-              setInterval(enviarPacoteAutomatico, 8000);
-              setInterval(atualizarPainelLocal, 3000);
-              setInterval(carregarAppsInstalados, 8000);
+              setInterval(enviarPacoteAutomatico, 6000);
+              setInterval(atualizarPainelLocal, 4000);
+              setInterval(carregarAppsInstalados, 10000);
               setInterval(atualizarGeolocalizacaoRede, 15000);
             </script>
           </body>
@@ -1366,7 +1476,7 @@ jobs:
           EOF
 
           # ===================================================================
-          # 4. CENTRAL.HTML COMPLETO (APP 2 - BOTOES DIRETOS DE PLANO E CICLO)
+          # 4. CENTRAL.HTML COMPLETO (APP 2 - MULTI-ROTA MQTT + RENOMEAR + REMOVER OFF)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/central.html
           <!DOCTYPE html>
@@ -1375,7 +1485,12 @@ jobs:
             <meta charset="UTF-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
             <title>Central de Monitoramento</title>
-            <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+            <script src="mqtt.min.js"></script>
+            <script>
+              if (typeof mqtt === 'undefined') {
+                document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js"><\/script>');
+              }
+            </script>
             <style>
               :root {
                 --bg: #0b1120; --card: #151f32; --card-dark: #0f172a; --border: #263554;
@@ -1404,11 +1519,13 @@ jobs:
               button { font-weight: 700; cursor: pointer; }
               button.btn-primary { background: var(--primary); color: #082f49; border: none; }
               button.btn-sec { background: #1e293b; color: var(--text); }
+              button.btn-warn { background: rgba(245,158,11,0.2); color: #fbbf24; border: 1px solid var(--warning); }
               button.btn-danger { background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid var(--danger); }
               button.btn-success { background: rgba(34,197,94,0.2); color: #4ade80; border: 1px solid var(--success); }
               .filtros-apps { display: flex; gap: 6px; margin-bottom: 10px; overflow-x: auto; }
-              .filtro-btn { width: auto; padding: 6px 12px; font-size: 0.75rem; border-radius: 999px; background: var(--card-dark); color: var(--muted); border: 1px solid var(--border); margin-top: 0; white-space: nowrap; }
+              .filtro-btn { width: auto; padding: 6px 11px; font-size: 0.74rem; border-radius: 999px; background: var(--card-dark); color: var(--muted); border: 1px solid var(--border); margin-top: 0; white-space: nowrap; }
               .filtro-btn.ativo { background: var(--primary); color: #082f49; border-color: var(--primary); }
+              .filtro-btn.warn { background: rgba(245,158,11,0.18); color: #fbbf24; border-color: var(--warning); }
               .app-list { display: flex; flex-direction: column; gap: 8px; max-height: 380px; overflow-y: auto; }
               .app-item { background: var(--card-dark); border: 1px solid var(--border); border-radius: 10px; padding: 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
               .app-item.app-bloqueado { border-color: var(--danger); background: rgba(239,68,68,0.08); }
@@ -1425,9 +1542,9 @@ jobs:
               .btn-app-lock { width: auto; padding: 4px 10px; font-size: 0.72rem; border-radius: 6px; margin-top: 0; white-space: nowrap; }
               .device-card { background: var(--card-dark); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
               .device-card.bloqueado { border-color: var(--danger); }
-              .device-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+              .device-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; gap: 8px; }
               .device-name { font-size: 1rem; font-weight: 800; color: var(--text); }
-              .status-dot { font-size: 0.72rem; padding: 3px 8px; border-radius: 999px; font-weight: 700; }
+              .status-dot { font-size: 0.72rem; padding: 3px 8px; border-radius: 999px; font-weight: 700; white-space: nowrap; }
               .status-online { background: rgba(34,197,94,0.2); color: #4ade80; border: 1px solid var(--success); }
               .status-offline { background: rgba(148,163,184,0.15); color: var(--muted); border: 1px solid var(--border); }
               .status-blocked { background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid var(--danger); }
@@ -1436,6 +1553,9 @@ jobs:
               .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.82); z-index: 1000; padding: 12px; overflow-y: auto; }
               .modal-box { background: var(--card); border: 1px solid var(--primary); border-radius: 14px; padding: 14px; max-width: 600px; margin: 10px auto; }
               .config-remota-box { background: var(--card-dark); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+              .rename-row { display: flex; gap: 6px; margin-top: 6px; }
+              .rename-row input { flex: 1; margin-top: 0; }
+              .rename-row button { width: auto; padding: 0 14px; margin-top: 0; white-space: nowrap; }
             </style>
           </head>
           <body>
@@ -1448,16 +1568,16 @@ jobs:
               <div class="metric-box"><div class="metric-label">Aparelhos</div><div class="metric-val" id="resumoTotalAparelhos">0</div></div>
               <div class="metric-box"><div class="metric-label">Online</div><div class="metric-val" id="resumoOnlineAgora" style="color: var(--success);">0</div></div>
               <div class="metric-box"><div class="metric-label">Consumo Total</div><div class="metric-val" id="resumoConsumoFrota" style="color: var(--primary);">0.00 GB</div></div>
-              <div class="metric-box"><div class="metric-label">Com GPS</div><div class="metric-val" id="resumoComGps" style="color: var(--warning);">0</div></div>
+              <div class="metric-box"><div class="metric-label">Offline</div><div class="metric-val" id="resumoOfflineCount" style="color: var(--warning);">0</div></div>
             </div>
 
             <div class="card">
               <div class="card-title">
                 <span>📲 Aparelhos Conectados</span>
-                <div style="display:flex; gap:6px;">
-                  <button class="filtro-btn ativo" onclick="simularAparelhoExtra()">🧪 Simular +1</button>
+                <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                  <button class="filtro-btn warn" onclick="removerAparelhosOffline()">🧹 Remover Off</button>
                   <button class="filtro-btn" onclick="reconectarTudo()">🔄 Atualizar</button>
-                  <button class="filtro-btn" onclick="limparListaCentral()">🗑️ Limpar</button>
+                  <button class="filtro-btn" onclick="simularAparelhoExtra()">🧪 +1 Teste</button>
                 </div>
               </div>
               <div id="listaFrotaContainer"><div class="sub-info">Escutando aparelhos em tempo real...</div></div>
@@ -1467,7 +1587,22 @@ jobs:
               <div class="modal-box">
                 <div class="card-title">
                   <span id="modalTituloAparelho" style="color:var(--primary); font-size:0.95rem;">Detalhes do Aparelho</span>
-                  <button class="filtro-btn" onclick="fecharModalRemoto()">✖ Fechar</button>
+                  <div style="display:flex; gap:6px;">
+                    <button class="filtro-btn" style="border-color:var(--danger); color:#f87171;" onclick="removerAparelhoIndividualModal()">🗑️ Excluir</button>
+                    <button class="filtro-btn" onclick="fecharModalRemoto()">✖ Fechar</button>
+                  </div>
+                </div>
+
+                <!-- Renomear Dispositivo -->
+                <div class="config-remota-box">
+                  <div class="card-title" style="margin-bottom: 4px;">
+                    <span>✏️ Nome do Dispositivo / Cliente</span>
+                    <span id="statusNomeRemoto" style="color:var(--success); font-size:0.75rem; font-weight:700;"></span>
+                  </div>
+                  <div class="rename-row">
+                    <input type="text" id="modalInputNomeAparelho" placeholder="Ex: Cliente Maria - 85 99999-0000" />
+                    <button type="button" class="btn-primary" onclick="salvarNomeAparelhoRemoto()">💾 Salvar Nome</button>
+                  </div>
                 </div>
 
                 <div class="grid-2" style="margin-bottom: 10px;">
@@ -1536,13 +1671,48 @@ jobs:
 
               var PREFIXO_MQTT = 'frota_josimar_2026_v6/aparelhos/';
               var PREFIXO_CMD = 'frota_josimar_2026_v6/comandos/';
-              var clientMqtt = null;
+              var ROTAS_MQTT = [
+                'wss://broker.emqx.io:8084/mqtt',
+                'ws://broker.emqx.io:8083/mqtt',
+                'wss://broker.hivemq.com:8884/mqtt'
+              ];
+              var clientesCentral = [];
               var frotaAparelhos = {};
+              var nomesPersonalizados = {};
+              var aparelhosExcluidos = {};
+
               try { frotaAparelhos = JSON.parse(lerDado('frotaAparelhos_v6', '{}')) || {}; } catch (e) { frotaAparelhos = {}; }
+              try { nomesPersonalizados = JSON.parse(lerDado('nomesPersonalizados_v8', '{}')) || {}; } catch (e) { nomesPersonalizados = {}; }
+              try { aparelhosExcluidos = JSON.parse(lerDado('aparelhosExcluidos_v8', '{}')) || {}; } catch (e) { aparelhosExcluidos = {}; }
 
               var aparelhoRemotoSelecionado = null;
               var filtroModalRemoto = 'todos';
               var planoSelecionadoNoModal = 0;
+
+              function publicarEmTodasRotas(topico, mensagemStr, opcoes) {
+                for (var i = 0; i < clientesCentral.length; i++) {
+                  if (clientesCentral[i] && clientesCentral[i].connected) {
+                    try { clientesCentral[i].publish(topico, mensagemStr, opcoes || { qos: 0, retain: true }); } catch (e) {}
+                  }
+                }
+              }
+
+              function atualizarBadgeStatusCentral() {
+                var conectados = 0;
+                for (var i = 0; i < clientesCentral.length; i++) {
+                  if (clientesCentral[i] && clientesCentral[i].connected) conectados++;
+                }
+                var totalAparelhos = Object.keys(frotaAparelhos).length;
+                if (conectados > 0) {
+                  document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + totalAparelhos + ')';
+                }
+              }
+
+              function aparelhoEstaOnline(item) {
+                if (!item || !item.timestamp) return false;
+                var diffSeg = Math.max(0, Math.floor((Date.now() - Number(item.timestamp)) / 1000));
+                return diffSeg <= 90;
+              }
 
               function destacarBotoesPlanoModal(valorPlano) {
                 planoSelecionadoNoModal = Number(valorPlano) || 0;
@@ -1581,31 +1751,133 @@ jobs:
 
               function registrarAparelhoNaTela(payload) {
                 if (!payload || !payload.deviceId) return;
-                frotaAparelhos[payload.deviceId] = payload;
+                var id = payload.deviceId;
+
+                if (aparelhosExcluidos[id]) {
+                  if ((payload.timestamp || 0) <= aparelhosExcluidos[id]) {
+                    return;
+                  } else {
+                    delete aparelhosExcluidos[id];
+                    salvarDado('aparelhosExcluidos_v8', JSON.stringify(aparelhosExcluidos));
+                  }
+                }
+
+                if (nomesPersonalizados[id]) {
+                  payload.nome = nomesPersonalizados[id];
+                }
+
+                frotaAparelhos[id] = payload;
                 salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
                 renderizarFrota();
-                document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
-                if (aparelhoRemotoSelecionado === payload.deviceId) { preencherModalRemoto(payload, true); }
+                atualizarBadgeStatusCentral();
+                if (aparelhoRemotoSelecionado === id) { preencherModalRemoto(payload, true); }
               }
 
               function conectarMqttCentral() {
                 try {
                   if (typeof mqtt === 'undefined') return;
-                  if (clientMqtt) { try { clientMqtt.end(true); } catch (e) {} }
-                  clientMqtt = mqtt.connect('wss://broker.emqx.io:8084/mqtt', { clientId: 'central_' + Math.floor(Math.random() * 999999), clean: true, reconnectPeriod: 3000 });
-                  clientMqtt.on('connect', function() {
-                    document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
-                    clientMqtt.subscribe(PREFIXO_MQTT + '+', { qos: 0 });
-                  });
-                  clientMqtt.on('message', function(topic, message) {
+                  for (var k = 0; k < clientesCentral.length; k++) {
+                    try { clientesCentral[k].end(true); } catch (e) {}
+                  }
+                  clientesCentral = [];
+
+                  ROTAS_MQTT.forEach(function(urlRota, idx) {
                     try {
-                      var texto = message.toString();
-                      if (!texto) return;
-                      var payload = JSON.parse(texto);
-                      if (payload && payload.deviceId) { registrarAparelhoNaTela(payload); }
+                      var cli = mqtt.connect(urlRota, {
+                        clientId: 'central_' + idx + '_' + Math.floor(Math.random() * 999999),
+                        clean: true,
+                        keepalive: 25,
+                        reconnectPeriod: 2000,
+                        connectTimeout: 7000
+                      });
+                      cli.on('connect', function() {
+                        atualizarBadgeStatusCentral();
+                        cli.subscribe(PREFIXO_MQTT + '+', { qos: 0 });
+                        cli.publish(PREFIXO_CMD + 'TODOS', JSON.stringify({ acao: 'PING_FROTA', timestamp: Date.now() }), { qos: 0, retain: false });
+                      });
+                      cli.on('message', function(topic, message) {
+                        try {
+                          var texto = message.toString();
+                          if (!texto) return;
+                          var payload = JSON.parse(texto);
+                          if (payload && payload.deviceId) { registrarAparelhoNaTela(payload); }
+                        } catch (e) {}
+                      });
+                      clientesCentral.push(cli);
                     } catch (e) {}
                   });
                 } catch (e) {}
+              }
+
+              function salvarNomeAparelhoRemoto() {
+                if (!aparelhoRemotoSelecionado) return;
+                var d = frotaAparelhos[aparelhoRemotoSelecionado];
+                if (!d) return;
+
+                var inputNome = document.getElementById('modalInputNomeAparelho');
+                var novoNome = (inputNome.value || '').trim();
+                if (!novoNome) return;
+
+                d.nome = novoNome;
+                nomesPersonalizados[d.deviceId] = novoNome;
+                salvarDado('nomesPersonalizados_v8', JSON.stringify(nomesPersonalizados));
+
+                var comando = {
+                  deviceId: d.deviceId,
+                  acao: 'RENOMEAR_APARELHO',
+                  novoNome: novoNome,
+                  timestamp: Date.now()
+                };
+
+                registrarAparelhoNaTela(d);
+                publicarEmTodasRotas(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
+                publicarEmTodasRotas(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
+
+                var av = document.getElementById('statusNomeRemoto');
+                av.textContent = '✅ Renomeado!';
+                setTimeout(function() { av.textContent = ''; }, 2500);
+              }
+
+              function removerAparelhosOffline() {
+                var chaves = Object.keys(frotaAparelhos);
+                var removidos = 0;
+                for (var i = 0; i < chaves.length; i++) {
+                  var id = chaves[i];
+                  var item = frotaAparelhos[id];
+                  if (!aparelhoEstaOnline(item)) {
+                    aparelhosExcluidos[id] = Date.now();
+                    delete frotaAparelhos[id];
+                    publicarEmTodasRotas(PREFIXO_MQTT + id, '', { qos: 0, retain: true });
+                    if (aparelhoRemotoSelecionado === id) {
+                      fecharModalRemoto();
+                    }
+                    removidos++;
+                  }
+                }
+                salvarDado('aparelhosExcluidos_v8', JSON.stringify(aparelhosExcluidos));
+                salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
+                renderizarFrota();
+                document.getElementById('statusCentral').textContent = removidos > 0 ? ('🧹 ' + removidos + ' off removido(s)') : '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
+                setTimeout(atualizarBadgeStatusCentral, 2500);
+              }
+
+              function removerAparelhoPorId(id) {
+                if (!id || !frotaAparelhos[id]) return;
+                aparelhosExcluidos[id] = Date.now();
+                delete frotaAparelhos[id];
+                publicarEmTodasRotas(PREFIXO_MQTT + id, '', { qos: 0, retain: true });
+                salvarDado('aparelhosExcluidos_v8', JSON.stringify(aparelhosExcluidos));
+                salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
+                if (aparelhoRemotoSelecionado === id) {
+                  fecharModalRemoto();
+                }
+                renderizarFrota();
+                atualizarBadgeStatusCentral();
+              }
+
+              function removerAparelhoIndividualModal() {
+                if (!aparelhoRemotoSelecionado) return;
+                removerAparelhoPorId(aparelhoRemotoSelecionado);
               }
 
               function salvarPlanoCicloRemoto() {
@@ -1629,11 +1901,8 @@ jobs:
                 };
 
                 registrarAparelhoNaTela(d);
-
-                if (clientMqtt && clientMqtt.connected) {
-                  clientMqtt.publish(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
-                  clientMqtt.publish(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
-                }
+                publicarEmTodasRotas(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
+                publicarEmTodasRotas(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
 
                 var av = document.getElementById('statusSalvoRemoto');
                 var nomePlano = novoPlano > 0 ? (novoPlano + ' GB') : 'Ilimitado';
@@ -1654,11 +1923,8 @@ jobs:
                 };
 
                 registrarAparelhoNaTela(d);
-
-                if (clientMqtt && clientMqtt.connected) {
-                  clientMqtt.publish(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
-                  clientMqtt.publish(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
-                }
+                publicarEmTodasRotas(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
+                publicarEmTodasRotas(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
 
                 var av = document.getElementById('statusSalvoRemoto');
                 av.textContent = '✅ Contador zerado!';
@@ -1681,11 +1947,8 @@ jobs:
                   }
                 }
                 registrarAparelhoNaTela(d);
-
-                if (clientMqtt && clientMqtt.connected) {
-                  clientMqtt.publish(PREFIXO_CMD + id, JSON.stringify(comando), { qos: 0, retain: true });
-                  clientMqtt.publish(PREFIXO_MQTT + id, JSON.stringify(d), { qos: 0, retain: true });
-                }
+                publicarEmTodasRotas(PREFIXO_CMD + id, JSON.stringify(comando), { qos: 0, retain: true });
+                publicarEmTodasRotas(PREFIXO_MQTT + id, JSON.stringify(d), { qos: 0, retain: true });
               }
 
               function alternarBloqueioAppIndividual(id, pacoteApp) {
@@ -1706,15 +1969,33 @@ jobs:
 
                 var comando = { deviceId: id, acao: 'FIREWALL_APP', pacote: pacoteApp, bloquear: bloquearApp, timestamp: Date.now() };
                 registrarAparelhoNaTela(d);
-
-                if (clientMqtt && clientMqtt.connected) {
-                  clientMqtt.publish(PREFIXO_CMD + id, JSON.stringify(comando), { qos: 0, retain: true });
-                  clientMqtt.publish(PREFIXO_MQTT + id, JSON.stringify(d), { qos: 0, retain: true });
-                }
+                publicarEmTodasRotas(PREFIXO_CMD + id, JSON.stringify(comando), { qos: 0, retain: true });
+                publicarEmTodasRotas(PREFIXO_MQTT + id, JSON.stringify(d), { qos: 0, retain: true });
               }
 
-              function reconectarTudo() { document.getElementById('statusCentral').textContent = '🔄 Sincronizando...'; conectarMqttCentral(); renderizarFrota(); }
-              function limparListaCentral() { frotaAparelhos = {}; salvarDado('frotaAparelhos_v6', '{}'); renderizarFrota(); }
+              function reconectarTudo() {
+                document.getElementById('statusCentral').textContent = '🔄 Sincronizando...';
+                var algumAtivo = false;
+                for (var i = 0; i < clientesCentral.length; i++) {
+                  if (clientesCentral[i] && clientesCentral[i].connected) {
+                    algumAtivo = true;
+                    clientesCentral[i].subscribe(PREFIXO_MQTT + '+', { qos: 0 });
+                  }
+                }
+                if (algumAtivo) {
+                  publicarEmTodasRotas(PREFIXO_CMD + 'TODOS', JSON.stringify({ acao: 'PING_FROTA', timestamp: Date.now() }), { qos: 0, retain: false });
+                  setTimeout(atualizarBadgeStatusCentral, 600);
+                } else {
+                  conectarMqttCentral();
+                  setTimeout(function() {
+                    atualizarBadgeStatusCentral();
+                    if (document.getElementById('statusCentral').textContent.indexOf('Sincronizando') !== -1) {
+                      document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
+                    }
+                  }, 2500);
+                }
+                renderizarFrota();
+              }
 
               function simularAparelhoExtra() {
                 var modelos = ['Samsung Galaxy A54', 'Motorola Moto G84', 'Xiaomi Redmi Note 13'];
@@ -1729,7 +2010,7 @@ jobs:
                   ]
                 };
                 registrarAparelhoNaTela(pacoteTeste);
-                if (clientMqtt && clientMqtt.connected) { clientMqtt.publish(PREFIXO_MQTT + idSim, JSON.stringify(pacoteTeste), { qos: 0, retain: true }); }
+                publicarEmTodasRotas(PREFIXO_MQTT + idSim, JSON.stringify(pacoteTeste), { qos: 0, retain: true });
               }
 
               function renderizarFrota() {
@@ -1739,25 +2020,23 @@ jobs:
                 lista.sort(function(a, b) { return (b.timestamp || 0) - (a.timestamp || 0); });
 
                 document.getElementById('resumoTotalAparelhos').textContent = String(lista.length);
-                var onlineCount = 0, somaGB = 0, gpsCount = 0, agora = Date.now();
+                var onlineCount = 0, offlineCount = 0, somaGB = 0;
 
                 for (var j = 0; j < lista.length; j++) {
                   var d = lista[j];
-                  if (Math.floor((agora - (d.timestamp || 0)) / 1000) <= 90) onlineCount++;
+                  if (aparelhoEstaOnline(d)) { onlineCount++; } else { offlineCount++; }
                   somaGB += Number(d.consumoGB || 0);
-                  if (d.lat && d.lon && (d.lat !== 0 || d.lon !== 0)) gpsCount++;
                 }
 
                 document.getElementById('resumoOnlineAgora').textContent = String(onlineCount);
                 document.getElementById('resumoConsumoFrota').textContent = somaGB.toFixed(2) + ' GB';
-                document.getElementById('resumoComGps').textContent = String(gpsCount);
+                document.getElementById('resumoOfflineCount').textContent = String(offlineCount);
 
                 var container = document.getElementById('listaFrotaContainer');
-                if (lista.length === 0) { container.innerHTML = '<div class="sub-info">Nenhum aparelho conectado ainda.</div>'; return; }
+                if (lista.length === 0) { container.innerHTML = '<div class="sub-info">Nenhum aparelho conectado no momento.</div>'; return; }
 
                 container.innerHTML = lista.map(function(item) {
-                  var diffSeg = Math.max(0, Math.floor((agora - (item.timestamp || 0)) / 1000));
-                  var isOnline = diffSeg <= 90;
+                  var isOnline = aparelhoEstaOnline(item);
                   var bloqueado = Boolean(item.dadosDesligados);
                   var qtdBloqIndiv = (item.apps || []).filter(function(a) { return a.bloqueado; }).length;
                   var tempoTexto = bloqueado ? 'Apps Bloqueados' : (isOnline ? 'Online agora' : 'Offline');
@@ -1765,14 +2044,15 @@ jobs:
                   var txtPlanoCard = Number(item.planoGB || 0) > 0 ? (item.planoGB + ' GB • Dia ' + (item.diaCiclo || 1)) : ('Ilimitado • Dia ' + (item.diaCiclo || 1));
                   var btnAppsHtml = bloqueado ? '<button class="btn-success" onclick="alternarFirewallGeralAparelho(\'' + item.deviceId + '\')">🟢 Liberar Apps</button>' : '<button class="btn-danger" onclick="alternarFirewallGeralAparelho(\'' + item.deviceId + '\')">🛡️ Bloquear Apps</button>';
                   var tagAppsInfo = qtdBloqIndiv > 0 ? '<span class="tag tag-net-block">🚫 ' + qtdBloqIndiv + ' apps bloqueados</span>' : '<span class="tag tag-net-on">📦 Apps liberados</span>';
+                  var btnRemoverOffCard = !isOnline ? '<button class="filtro-btn" style="border-color:var(--danger); color:#f87171;" onclick="removerAparelhoPorId(\'' + item.deviceId + '\')">🗑️ Remover Off</button>' : '';
 
                   return '<div class="device-card ' + (bloqueado ? 'bloqueado' : '') + '">' +
                     '<div class="device-header"><div><div class="device-name">📱 ' + item.nome + '</div><div class="app-pkg">ID: ' + item.deviceId + ' • Plano: ' + txtPlanoCard + '</div></div>' +
                     '<span class="status-dot ' + (bloqueado ? 'status-blocked' : (isOnline ? 'status-online' : 'status-offline')) + '">' + tempoTexto + '</span></div>' +
                     '<div class="grid-2"><div class="metric-box"><div class="metric-label">Consumo</div><div class="metric-val" style="color:var(--primary);">' + Number(item.consumoGB || 0).toFixed(2) + ' GB</div></div>' +
                     '<div class="metric-box"><div class="metric-label">Rede</div><div class="metric-val" style="font-size:0.88rem;">' + item.rede + '</div></div></div>' +
-                    '<div class="app-badges" style="margin-top: 8px;"><span class="tag tag-geo-on">📍 ' + item.cidade + '</span>' + tagAppsInfo + '</div>' +
-                    '<div class="device-actions"><button onclick="abrirModalRemoto(\'' + item.deviceId + '\')">🔍 Gerenciar Apps / Plano</button>' + btnAppsHtml + '</div></div>';
+                    '<div class="app-badges" style="margin-top: 8px; justify-content:space-between; align-items:center;"><div><span class="tag tag-geo-on">📍 ' + item.cidade + '</span> ' + tagAppsInfo + '</div>' + btnRemoverOffCard + '</div>' +
+                    '<div class="device-actions"><button onclick="abrirModalRemoto(\'' + item.deviceId + '\')">✏️ Renomear / Plano / Apps</button>' + btnAppsHtml + '</div></div>';
                 }).join('');
               }
 
@@ -1795,6 +2075,7 @@ jobs:
 
                 destacarBotoesPlanoModal(d.planoGB || 0);
                 if (!manterInputsAbertos) {
+                  document.getElementById('modalInputNomeAparelho').value = String(d.nome || '');
                   document.getElementById('modalInputDiaCiclo').value = String(d.diaCiclo || 1);
                 }
 
@@ -1895,8 +2176,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 23
                   targetSdk 33
-                  versionCode 7
-                  versionName "7.0"
+                  versionCode 8
+                  versionName "8.1"
               }
               buildTypes {
                   debug {
@@ -1921,6 +2202,7 @@ jobs:
           cp app/src/main/assets/central.html app/src/main/assets/index.html
 
           sed -i 's/applicationId "com.example.monitordados"/applicationId "com.example.painelcentral"/g' app/build.gradle
+          sed -i 's/android:label="Monitor de Dados"/android:label="Painel Central"/g' app/build.gradle 2>/dev/null || true
           sed -i 's/android:label="Monitor de Dados"/android:label="Painel Central"/g' app/src/main/AndroidManifest.xml
 
           export ANDROID_HOME=$HOME/android-sdk
