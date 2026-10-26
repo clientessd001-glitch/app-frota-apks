@@ -1,4 +1,4 @@
-name: Gerar 2 APKs - Monitor e Central
+name: Gerar 2 APKs - Monitor e Central (v9.0 Firebase)
 
 on:
   push:
@@ -40,13 +40,13 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
 
-      - name: 4. Gerar todos os arquivos completos do projeto (Manifest + Java + MQTT Local + HTMLs)
+      - name: 4. Gerar todos os arquivos completos do projeto (Manifest + Java + Firebase + MQTT + HTMLs)
         run: |
           mkdir -p app/src/main/assets
           mkdir -p app/src/main/java/com/example/monitordados
           mkdir -p APKs-Prontos
 
-          # Baixa a biblioteca MQTT direto para dentro do APK (evita falha de internet ao abrir)
+          # Baixa a biblioteca MQTT direto para dentro do APK
           curl -sL https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js -o app/src/main/assets/mqtt.min.js || true
           if [ ! -s app/src/main/assets/mqtt.min.js ]; then
             curl -sL https://cdn.jsdelivr.net/npm/mqtt@4.3.7/dist/mqtt.min.js -o app/src/main/assets/mqtt.min.js || true
@@ -945,7 +945,7 @@ jobs:
           EOF
 
           # ===================================================================
-          # 3. INDEX.HTML COMPLETO (APP 1 - MONITOR: GEO OCULTA, PLANO TRAVADO E MULTI-MQTT)
+          # 3. INDEX.HTML COMPLETO (APP 1 - MONITOR: FIREBASE + MQTT + PLANO TRAVADO)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/index.html
           <!DOCTYPE html>
@@ -1014,7 +1014,7 @@ jobs:
             <div class="header">
               <div>
                 <h1>📊 Monitor de Dados</h1>
-                <div class="header-sub" id="statusNuvemTopo">☁️ Conectando aparelho...</div>
+                <div class="header-sub" id="statusNuvemTopo">☁️ Conectando ao Firebase...</div>
               </div>
               <span id="badgeRedeTopo" class="badge-rede">🟢 4G/5G Ativo</span>
             </div>
@@ -1100,6 +1100,8 @@ jobs:
             </div>
 
             <script>
+              var FIREBASE_URL = 'https://painel-2d29e-default-rtdb.firebaseio.com';
+
               var memoriaSegura = {};
               function lerDado(chave, padrao) {
                 try { var val = window.localStorage.getItem(chave); return val !== null ? val : padrao; }
@@ -1118,7 +1120,8 @@ jobs:
                 'wss://broker.hivemq.com:8884/mqtt'
               ];
               var clientesMqtt = [];
-              var ultimoCmdTimestamp = 0;
+              var ultimoCmdTimestamp = parseInt(lerDado('ultimoCmdTs_v9', '0'), 10) || 0;
+              var ultimoZerarTimestamp = parseInt(lerDado('ultimoZerarTs_v9', '0'), 10) || 0;
 
               var planoGB = parseFloat(lerDado('planoGB', '0')) || 0;
               var diaCiclo = parseInt(lerDado('diaCiclo', '1'), 10) || 1;
@@ -1329,12 +1332,67 @@ jobs:
                 }).join('');
               }
 
+              function aplicarConfiguracaoNuvemFirebase(cfg) {
+                if (!cfg || typeof cfg !== 'object') return;
+                var mudouAlgo = false;
+                var mudouFirewall = false;
+
+                if (cfg.nome && String(cfg.nome).trim() && String(cfg.nome).trim() !== nomeAparelho) {
+                  nomeAparelho = String(cfg.nome).trim();
+                  salvarDado('nomeAparelho_v6', nomeAparelho);
+                  document.getElementById('statusNuvemTopo').textContent = '🔥 Online • ' + nomeAparelho;
+                  mudouAlgo = true;
+                }
+                if (cfg.planoGB !== undefined && Number(cfg.planoGB) !== Number(planoGB)) {
+                  planoGB = parseFloat(cfg.planoGB) || 0;
+                  salvarDado('planoGB', planoGB);
+                  mudouAlgo = true;
+                }
+                if (cfg.diaCiclo !== undefined && Number(cfg.diaCiclo) !== Number(diaCiclo)) {
+                  diaCiclo = Math.max(1, Math.min(28, parseInt(cfg.diaCiclo, 10) || 1));
+                  salvarDado('diaCiclo', diaCiclo);
+                  mudouAlgo = true;
+                }
+                if (cfg.dadosDesligados !== undefined && Boolean(cfg.dadosDesligados) !== Boolean(firewallGeralAtivo)) {
+                  firewallGeralAtivo = Boolean(cfg.dadosDesligados);
+                  salvarDado('firewallGeral_v7', firewallGeralAtivo ? 'true' : 'false');
+                  mudouFirewall = true;
+                }
+                if (cfg.appsBloqueadosMap !== undefined) {
+                  var mapaNovo = cfg.appsBloqueadosMap || {};
+                  if (JSON.stringify(mapaNovo) !== JSON.stringify(appsBloqueadosMap)) {
+                    appsBloqueadosMap = mapaNovo;
+                    salvarDado('appsBloqueados_v7', JSON.stringify(appsBloqueadosMap));
+                    mudouFirewall = true;
+                  }
+                }
+                if (cfg.zerarTimestamp && Number(cfg.zerarTimestamp) > ultimoZerarTimestamp) {
+                  ultimoZerarTimestamp = Number(cfg.zerarTimestamp);
+                  salvarDado('ultimoZerarTs_v9', ultimoZerarTimestamp);
+                  offsetZeroGB = ultimoConsumoBrutoGB;
+                  salvarDado('offsetZeroGB', offsetZeroGB);
+                  mudouAlgo = true;
+                }
+
+                if (mudouFirewall) {
+                  atualizarInterfaceFirewall();
+                } else if (mudouAlgo) {
+                  destacarBotoesPlanoLocal();
+                  atualizarPainelLocal();
+                  carregarAppsInstalados();
+                  enviarPacoteAutomatico();
+                }
+              }
+
               function processarComandoRecebido(message) {
                 try {
-                  var cmd = JSON.parse(message.toString());
+                  var cmd = typeof message === 'string' ? JSON.parse(message) : (message && message.acao ? message : JSON.parse(message.toString()));
                   if (!cmd) return;
-                  if (cmd.timestamp && cmd.timestamp === ultimoCmdTimestamp) return;
-                  if (cmd.timestamp) ultimoCmdTimestamp = cmd.timestamp;
+                  if (cmd.timestamp && Number(cmd.timestamp) <= ultimoCmdTimestamp) return;
+                  if (cmd.timestamp) {
+                    ultimoCmdTimestamp = Number(cmd.timestamp);
+                    salvarDado('ultimoCmdTs_v9', ultimoCmdTimestamp);
+                  }
 
                   if (cmd.acao === 'PING_FROTA') {
                     enviarPacoteAutomatico();
@@ -1371,7 +1429,7 @@ jobs:
                   if (cmd.acao === 'RENOMEAR_APARELHO' && cmd.novoNome) {
                     nomeAparelho = String(cmd.novoNome).trim();
                     salvarDado('nomeAparelho_v6', nomeAparelho);
-                    document.getElementById('statusNuvemTopo').textContent = '☁️ ' + nomeAparelho;
+                    document.getElementById('statusNuvemTopo').textContent = '🔥 Online • ' + nomeAparelho;
                     enviarPacoteAutomatico();
                   }
                   if (cmd.acao === 'ZERAR_CONTADOR') {
@@ -1380,7 +1438,22 @@ jobs:
                 } catch (e) {}
               }
 
+              function sincronizarComandosFirebase() {
+                try {
+                  fetch(FIREBASE_URL + '/frota/config/' + encodeURIComponent(deviceId) + '.json?t=' + Date.now())
+                    .then(function(r) { return r.ok ? r.json() : null; })
+                    .then(function(cfg) { if (cfg) aplicarConfiguracaoNuvemFirebase(cfg); })
+                    .catch(function() {});
+
+                  fetch(FIREBASE_URL + '/frota/comandos/' + encodeURIComponent(deviceId) + '.json?t=' + Date.now())
+                    .then(function(r) { return r.ok ? r.json() : null; })
+                    .then(function(cmd) { if (cmd) processarComandoRecebido(cmd); })
+                    .catch(function() {});
+                } catch (e) {}
+              }
+
               function iniciarConexaoNuvem() {
+                sincronizarComandosFirebase();
                 try {
                   if (typeof mqtt === 'undefined') return;
                   for (var k = 0; k < clientesMqtt.length; k++) {
@@ -1398,7 +1471,7 @@ jobs:
                         connectTimeout: 8000
                       });
                       cli.on('connect', function() {
-                        document.getElementById('statusNuvemTopo').textContent = '☁️ Online • ' + nomeAparelho;
+                        document.getElementById('statusNuvemTopo').textContent = '🔥 Online • ' + nomeAparelho;
                         cli.subscribe(PREFIXO_CMD + deviceId, { qos: 0 });
                         cli.subscribe(PREFIXO_CMD + 'TODOS', { qos: 0 });
                         enviarPacoteAutomatico();
@@ -1428,15 +1501,25 @@ jobs:
                 };
 
                 var jsonStr = JSON.stringify(pacote);
-                var algumConectado = false;
+
+                // 1. Grava direto no Firebase Realtime Database
+                try {
+                  fetch(FIREBASE_URL + '/frota/aparelhos/' + encodeURIComponent(deviceId) + '.json', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: jsonStr
+                  }).then(function(res) {
+                    if (res && res.ok) {
+                      document.getElementById('statusNuvemTopo').textContent = '🔥 Online • ' + nomeAparelho;
+                    }
+                  }).catch(function() {});
+                } catch (e) {}
+
+                // 2. Publica em tempo real via MQTT
                 for (var i = 0; i < clientesMqtt.length; i++) {
                   if (clientesMqtt[i] && clientesMqtt[i].connected) {
-                    algumConectado = true;
                     try { clientesMqtt[i].publish(PREFIXO_MQTT + deviceId, jsonStr, { qos: 0, retain: true }); } catch (e) {}
                   }
-                }
-                if (algumConectado) {
-                  document.getElementById('statusNuvemTopo').textContent = '☁️ Online • ' + nomeAparelho;
                 }
               }
 
@@ -1444,6 +1527,7 @@ jobs:
                 try {
                   atualizarPainelLocal();
                   atualizarGeolocalizacaoRede();
+                  sincronizarComandosFirebase();
                   var temAtivo = false;
                   for (var i = 0; i < clientesMqtt.length; i++) {
                     if (clientesMqtt[i] && clientesMqtt[i].connected) { temAtivo = true; break; }
@@ -1465,7 +1549,8 @@ jobs:
               atualizarGeolocalizacaoRede();
               atualizarInterfaceFirewall();
               iniciarConexaoNuvem();
-              setTimeout(enviarPacoteAutomatico, 1000);
+              setTimeout(enviarPacoteAutomatico, 1200);
+              setInterval(sincronizarComandosFirebase, 4000);
               setInterval(enviarPacoteAutomatico, 6000);
               setInterval(atualizarPainelLocal, 4000);
               setInterval(carregarAppsInstalados, 10000);
@@ -1476,7 +1561,7 @@ jobs:
           EOF
 
           # ===================================================================
-          # 4. CENTRAL.HTML COMPLETO (APP 2 - MULTI-ROTA MQTT + RENOMEAR + REMOVER OFF)
+          # 4. CENTRAL.HTML COMPLETO (APP 2 - FIREBASE + MQTT + CONTROLE TOTAL)
           # ===================================================================
           cat << 'EOF' > app/src/main/assets/central.html
           <!DOCTYPE html>
@@ -1561,7 +1646,7 @@ jobs:
           <body>
             <div class="header">
               <h1>🖥️ Central de Monitoramento</h1>
-              <span id="statusCentral" class="badge-rede">🟢 Conectando...</span>
+              <span id="statusCentral" class="badge-rede">🔥 Conectando Firebase...</span>
             </div>
 
             <div class="grid-4">
@@ -1580,7 +1665,7 @@ jobs:
                   <button class="filtro-btn" onclick="simularAparelhoExtra()">🧪 +1 Teste</button>
                 </div>
               </div>
-              <div id="listaFrotaContainer"><div class="sub-info">Escutando aparelhos em tempo real...</div></div>
+              <div id="listaFrotaContainer"><div class="sub-info">Carregando aparelhos do Firebase...</div></div>
             </div>
 
             <div id="modalAparelhoRemoto" class="modal-overlay">
@@ -1659,6 +1744,8 @@ jobs:
             </div>
 
             <script>
+              var FIREBASE_URL = 'https://painel-2d29e-default-rtdb.firebaseio.com';
+
               var memoriaSegura = {};
               function lerDado(chave, padrao) {
                 try { var val = window.localStorage.getItem(chave); return val !== null ? val : padrao; }
@@ -1680,6 +1767,7 @@ jobs:
               var frotaAparelhos = {};
               var nomesPersonalizados = {};
               var aparelhosExcluidos = {};
+              var firebaseConectado = false;
 
               try { frotaAparelhos = JSON.parse(lerDado('frotaAparelhos_v6', '{}')) || {}; } catch (e) { frotaAparelhos = {}; }
               try { nomesPersonalizados = JSON.parse(lerDado('nomesPersonalizados_v8', '{}')) || {}; } catch (e) { nomesPersonalizados = {}; }
@@ -1697,14 +1785,75 @@ jobs:
                 }
               }
 
+              function gravarComandoEConfigFirebase(deviceId, comandoObj, dadosAparelho, configPatch) {
+                try {
+                  if (comandoObj) {
+                    fetch(FIREBASE_URL + '/frota/comandos/' + encodeURIComponent(deviceId) + '.json', {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(comandoObj)
+                    }).catch(function() {});
+                  }
+                  if (configPatch) {
+                    fetch(FIREBASE_URL + '/frota/config/' + encodeURIComponent(deviceId) + '.json', {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(configPatch)
+                    }).catch(function() {});
+                  }
+                  if (dadosAparelho) {
+                    fetch(FIREBASE_URL + '/frota/aparelhos/' + encodeURIComponent(deviceId) + '.json', {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(dadosAparelho)
+                    }).catch(function() {});
+                  }
+                } catch (e) {}
+              }
+
+              function excluirAparelhoDoFirebase(id) {
+                try {
+                  fetch(FIREBASE_URL + '/frota/aparelhos/' + encodeURIComponent(id) + '.json', { method: 'DELETE' }).catch(function() {});
+                  fetch(FIREBASE_URL + '/frota/comandos/' + encodeURIComponent(id) + '.json', { method: 'DELETE' }).catch(function() {});
+                  fetch(FIREBASE_URL + '/frota/config/' + encodeURIComponent(id) + '.json', { method: 'DELETE' }).catch(function() {});
+                } catch (e) {}
+              }
+
+              function carregarFrotaDoFirebase() {
+                try {
+                  fetch(FIREBASE_URL + '/frota/aparelhos.json?t=' + Date.now())
+                    .then(function(res) {
+                      if (!res.ok) return null;
+                      firebaseConectado = true;
+                      return res.json();
+                    })
+                    .then(function(mapaNuvem) {
+                      atualizarBadgeStatusCentral();
+                      if (!mapaNuvem || typeof mapaNuvem !== 'object') {
+                        renderizarFrota();
+                        return;
+                      }
+                      var ids = Object.keys(mapaNuvem);
+                      for (var i = 0; i < ids.length; i++) {
+                        var item = mapaNuvem[ids[i]];
+                        if (item && item.deviceId) {
+                          registrarAparelhoNaTela(item, true);
+                        }
+                      }
+                      renderizarFrota();
+                    })
+                    .catch(function() {});
+                } catch (e) {}
+              }
+
               function atualizarBadgeStatusCentral() {
                 var conectados = 0;
                 for (var i = 0; i < clientesCentral.length; i++) {
                   if (clientesCentral[i] && clientesCentral[i].connected) conectados++;
                 }
                 var totalAparelhos = Object.keys(frotaAparelhos).length;
-                if (conectados > 0) {
-                  document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + totalAparelhos + ')';
+                if (firebaseConectado || conectados > 0) {
+                  document.getElementById('statusCentral').textContent = '🔥 Firebase Ao Vivo (' + totalAparelhos + ')';
                 }
               }
 
@@ -1749,7 +1898,7 @@ jobs:
                 }
               }
 
-              function registrarAparelhoNaTela(payload) {
+              function registrarAparelhoNaTela(payload, silencioso) {
                 if (!payload || !payload.deviceId) return;
                 var id = payload.deviceId;
 
@@ -1768,12 +1917,15 @@ jobs:
 
                 frotaAparelhos[id] = payload;
                 salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
-                renderizarFrota();
-                atualizarBadgeStatusCentral();
+                if (!silencioso) {
+                  renderizarFrota();
+                  atualizarBadgeStatusCentral();
+                }
                 if (aparelhoRemotoSelecionado === id) { preencherModalRemoto(payload, true); }
               }
 
               function conectarMqttCentral() {
+                carregarFrotaDoFirebase();
                 try {
                   if (typeof mqtt === 'undefined') return;
                   for (var k = 0; k < clientesCentral.length; k++) {
@@ -1800,7 +1952,7 @@ jobs:
                           var texto = message.toString();
                           if (!texto) return;
                           var payload = JSON.parse(texto);
-                          if (payload && payload.deviceId) { registrarAparelhoNaTela(payload); }
+                          if (payload && payload.deviceId) { registrarAparelhoNaTela(payload, false); }
                         } catch (e) {}
                       });
                       clientesCentral.push(cli);
@@ -1829,12 +1981,13 @@ jobs:
                   timestamp: Date.now()
                 };
 
-                registrarAparelhoNaTela(d);
+                registrarAparelhoNaTela(d, false);
+                gravarComandoEConfigFirebase(d.deviceId, comando, d, { nome: novoNome, updatedAt: Date.now() });
                 publicarEmTodasRotas(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
                 publicarEmTodasRotas(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
 
                 var av = document.getElementById('statusNomeRemoto');
-                av.textContent = '✅ Renomeado!';
+                av.textContent = '✅ Renomeado no Firebase!';
                 setTimeout(function() { av.textContent = ''; }, 2500);
               }
 
@@ -1847,6 +2000,7 @@ jobs:
                   if (!aparelhoEstaOnline(item)) {
                     aparelhosExcluidos[id] = Date.now();
                     delete frotaAparelhos[id];
+                    excluirAparelhoDoFirebase(id);
                     publicarEmTodasRotas(PREFIXO_MQTT + id, '', { qos: 0, retain: true });
                     if (aparelhoRemotoSelecionado === id) {
                       fecharModalRemoto();
@@ -1857,7 +2011,7 @@ jobs:
                 salvarDado('aparelhosExcluidos_v8', JSON.stringify(aparelhosExcluidos));
                 salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
                 renderizarFrota();
-                document.getElementById('statusCentral').textContent = removidos > 0 ? ('🧹 ' + removidos + ' off removido(s)') : '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
+                document.getElementById('statusCentral').textContent = removidos > 0 ? ('🧹 ' + removidos + ' off removido(s)') : '🔥 Firebase Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
                 setTimeout(atualizarBadgeStatusCentral, 2500);
               }
 
@@ -1865,6 +2019,7 @@ jobs:
                 if (!id || !frotaAparelhos[id]) return;
                 aparelhosExcluidos[id] = Date.now();
                 delete frotaAparelhos[id];
+                excluirAparelhoDoFirebase(id);
                 publicarEmTodasRotas(PREFIXO_MQTT + id, '', { qos: 0, retain: true });
                 salvarDado('aparelhosExcluidos_v8', JSON.stringify(aparelhosExcluidos));
                 salvarDado('frotaAparelhos_v6', JSON.stringify(frotaAparelhos));
@@ -1900,7 +2055,8 @@ jobs:
                   timestamp: Date.now()
                 };
 
-                registrarAparelhoNaTela(d);
+                registrarAparelhoNaTela(d, false);
+                gravarComandoEConfigFirebase(d.deviceId, comando, d, { planoGB: novoPlano, diaCiclo: novoDia, updatedAt: Date.now() });
                 publicarEmTodasRotas(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
                 publicarEmTodasRotas(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
 
@@ -1915,14 +2071,16 @@ jobs:
                 var d = frotaAparelhos[aparelhoRemotoSelecionado];
                 if (!d) return;
 
+                var agoraTs = Date.now();
                 d.consumoGB = 0;
                 var comando = {
                   deviceId: d.deviceId,
                   acao: 'ZERAR_CONTADOR',
-                  timestamp: Date.now()
+                  timestamp: agoraTs
                 };
 
-                registrarAparelhoNaTela(d);
+                registrarAparelhoNaTela(d, false);
+                gravarComandoEConfigFirebase(d.deviceId, comando, d, { zerarTimestamp: agoraTs, updatedAt: agoraTs });
                 publicarEmTodasRotas(PREFIXO_CMD + d.deviceId, JSON.stringify(comando), { qos: 0, retain: true });
                 publicarEmTodasRotas(PREFIXO_MQTT + d.deviceId, JSON.stringify(d), { qos: 0, retain: true });
 
@@ -1946,7 +2104,8 @@ jobs:
                     d.apps[i].bloqueado = bloquearAgora || Boolean(d.appsBloqueadosMap && d.appsBloqueadosMap[d.apps[i].pacote]);
                   }
                 }
-                registrarAparelhoNaTela(d);
+                registrarAparelhoNaTela(d, false);
+                gravarComandoEConfigFirebase(id, comando, d, { dadosDesligados: bloquearAgora, updatedAt: Date.now() });
                 publicarEmTodasRotas(PREFIXO_CMD + id, JSON.stringify(comando), { qos: 0, retain: true });
                 publicarEmTodasRotas(PREFIXO_MQTT + id, JSON.stringify(d), { qos: 0, retain: true });
               }
@@ -1968,13 +2127,15 @@ jobs:
                 }
 
                 var comando = { deviceId: id, acao: 'FIREWALL_APP', pacote: pacoteApp, bloquear: bloquearApp, timestamp: Date.now() };
-                registrarAparelhoNaTela(d);
+                registrarAparelhoNaTela(d, false);
+                gravarComandoEConfigFirebase(id, comando, d, { appsBloqueadosMap: d.appsBloqueadosMap, updatedAt: Date.now() });
                 publicarEmTodasRotas(PREFIXO_CMD + id, JSON.stringify(comando), { qos: 0, retain: true });
                 publicarEmTodasRotas(PREFIXO_MQTT + id, JSON.stringify(d), { qos: 0, retain: true });
               }
 
               function reconectarTudo() {
-                document.getElementById('statusCentral').textContent = '🔄 Sincronizando...';
+                document.getElementById('statusCentral').textContent = '🔄 Sincronizando Firebase...';
+                carregarFrotaDoFirebase();
                 var algumAtivo = false;
                 for (var i = 0; i < clientesCentral.length; i++) {
                   if (clientesCentral[i] && clientesCentral[i].connected) {
@@ -1987,12 +2148,7 @@ jobs:
                   setTimeout(atualizarBadgeStatusCentral, 600);
                 } else {
                   conectarMqttCentral();
-                  setTimeout(function() {
-                    atualizarBadgeStatusCentral();
-                    if (document.getElementById('statusCentral').textContent.indexOf('Sincronizando') !== -1) {
-                      document.getElementById('statusCentral').textContent = '🟢 Ao Vivo (' + Object.keys(frotaAparelhos).length + ')';
-                    }
-                  }, 2500);
+                  setTimeout(atualizarBadgeStatusCentral, 2000);
                 }
                 renderizarFrota();
               }
@@ -2009,7 +2165,8 @@ jobs:
                     { nome: 'Instagram', pacote: 'com.instagram.android', totalMB: 2310.0, redeAtiva: 'Transmitindo', emTransmissao: true, usaGeo: true, geoAtiva: true, bloqueado: false }
                   ]
                 };
-                registrarAparelhoNaTela(pacoteTeste);
+                registrarAparelhoNaTela(pacoteTeste, false);
+                gravarComandoEConfigFirebase(idSim, null, pacoteTeste, null);
                 publicarEmTodasRotas(PREFIXO_MQTT + idSim, JSON.stringify(pacoteTeste), { qos: 0, retain: true });
               }
 
@@ -2128,6 +2285,7 @@ jobs:
 
               renderizarFrota();
               conectarMqttCentral();
+              setInterval(carregarFrotaDoFirebase, 3500);
               setInterval(renderizarFrota, 5000);
             </script>
           </body>
@@ -2176,8 +2334,8 @@ jobs:
                   applicationId "com.example.monitordados"
                   minSdk 23
                   targetSdk 33
-                  versionCode 8
-                  versionName "8.1"
+                  versionCode 9
+                  versionName "9.0"
               }
               buildTypes {
                   debug {
